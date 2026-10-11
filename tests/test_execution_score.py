@@ -534,3 +534,21 @@ def test_an_interval_ride_done_harder_reads_over_not_under():
     i = r["components"]["intensity"]
     assert i["direction"] == "above", i
     assert r["verdict"] == "over", r
+
+
+def test_a_file_mostly_just_outside_its_band_ridden_exactly_is_not_over():
+    """Library tempo file: 3 x 12 min at 75 % FTP (the Z2 ceiling), only 4 min
+    inside Z3. Its band takes in Z4, and the bulk of the work sits on the line
+    just below the band. Ridden exactly, noise spills that work into Z3 about
+    half the time; counted as entirely outside, the target share was 0.056 and
+    an exact ride read "over" at ratio 6."""
+    import structure_fidelity as sf
+    segs = sf.parse_zwo_file(ROOT / "src" / "workouts" / "tempo_3x30s-30s_120pct_71min.zwo")
+    assert es._edge_widened((3,), segs) == (3, 4)
+    p_in = es._planned_split((3, 4), segs)[0]
+    assert abs(p_in - 1380 / 4260) < 0.005, p_in
+    # ridden exactly: half of the 2280 s at 75 % lands in Z3, half in Z2
+    exact = _tiz(z1=1410, z2=1380, z3=1380, z5=90)
+    r = es.score_ride(_planned("tempo", 71, 52), _ride(dur_s=4260, tss=52, tiz=exact),
+                      "power", band_segments=segs)
+    assert r["verdict"] == "on_target", r

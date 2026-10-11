@@ -221,18 +221,33 @@ def _edge_widened(band: "tuple[int, ...]", segments) -> "tuple[int, ...]":
 
 def _planned_split(band: "tuple[int, ...]", segments) -> "tuple[float, float, float] | None":
     """Shares of the planned file's time (in band, above it, below it), per
-    second as _edge_widened reads it; None without a usable timeline."""
-    lo_z, hi_z = min(band), max(band)
-    n = inside = above = 0
+    second as _edge_widened reads it; None without a usable timeline.
+
+    A planned second within EDGE_TOL outside an edge counts half in band, half
+    out: ridden exactly, noise spills it across the line about half the time
+    (the reason the band was widened). Counting it all out made the target
+    share tiny for a file whose bulk sits just outside the band (3 x 12 min at
+    75 %, band Z3-Z4: 0.056), and an exact ride then read "over" at ratio 6."""
+    lo_edge = _ZONE_CEILING.get(min(band) - 1, -1.0)
+    hi_edge = _ZONE_CEILING.get(max(band), 99.0)
+    n = inside = above = 0.0
     for seg in segments or ():
         a, b, d = seg.get("lo"), seg.get("hi"), int(seg.get("dur_s") or 0)
         if a is None or b is None:
             continue
         for i in range(d):
-            z = _zone_of(float(a) + (float(b) - float(a)) * (i / (d - 1) if d > 1 else 0.0))
+            f = float(a) + (float(b) - float(a)) * (i / (d - 1) if d > 1 else 0.0)
             n += 1
-            inside += lo_z <= z <= hi_z
-            above += z > hi_z
+            if lo_edge < f <= hi_edge:
+                inside += 1
+            elif f > hi_edge:
+                if f - hi_edge <= EDGE_TOL:
+                    inside += 0.5
+                    above += 0.5
+                else:
+                    above += 1
+            elif lo_edge - f <= EDGE_TOL:
+                inside += 0.5
     if not n:
         return None
     return inside / n, above / n, (n - inside - above) / n
