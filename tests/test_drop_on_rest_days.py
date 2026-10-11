@@ -39,7 +39,17 @@ function cell(attrs) {
 }
 global.HTMLElement = Object;
 const ev = { dataTransfer: { setData() {}, effectAllowed: '' }, currentTarget: null };
+// Today, for the past-day rule: the drag's source day, so the fixture's
+// later days are all ahead (TODAY is replaced per test when needed).
+const _RealDate = Date;
+global.Date = class extends _RealDate {
+  constructor(...a) { super(...(a.length ? a : [TODAY + 'T12:00:00'])); }
+};
 """
+
+
+def _today(iso: str) -> str:
+    return f"const TODAY = '{iso}';\n"
 
 
 def _run(js: str) -> dict:
@@ -49,7 +59,7 @@ def _run(js: str) -> dict:
 
 
 def test_calendar_rest_day_is_a_drop_target_and_unavailable_is_not():
-    js = _DOM + _fn("_calIsoMonday") + "\n" + _fn("calDragStart") + """
+    js = _today("2026-09-23") + _DOM + _fn("_calIsoMonday") + "\n" + _fn("calDragStart") + """
 const cells = {
   rest: cell({'data-date': '2026-09-24', 'data-cs': 'rest'}),
   unavailable: cell({'data-date': '2026-09-25', 'data-cs': 'future_unavailable'}),
@@ -71,7 +81,7 @@ console.log(JSON.stringify(out));
 
 
 def test_plan_grid_rest_day_is_a_drop_target_and_unavailable_is_not():
-    js = _DOM + _fn("_pgIsoMonday") + "\n" + _fn("pgDragStart") + """
+    js = _today("2026-09-23") + _DOM + _fn("_pgIsoMonday") + "\n" + _fn("pgDragStart") + """
 const cells = {
   rest: cell({'data-pg-day': '2026-09-24', 'data-pg-rest': '1', 'data-pg-completed': '0'}),
   unavailable: cell({'data-pg-day': '2026-09-25', 'data-pg-rest': '1', 'data-pg-completed': '0'}),
@@ -93,3 +103,36 @@ console.log(JSON.stringify(out));
 def test_rest_cells_carry_drop_handlers_in_both_views():
     assert "ondrop=\"calDrop(event,'${esc(d.date)}',${wi})\">" in SRC
     assert "ondrop=\"pgDrop(event,'${dayStr}',${wi})\"`" in SRC
+
+
+def test_a_day_that_has_passed_is_not_a_drop_target_in_either_view():
+    """A passed day is a record of what was ridden: a session dropped there is
+    "missed" the moment it lands. Today Wednesday, dragging Thursday."""
+    cal = _today("2026-09-23") + _DOM + _fn("_calIsoMonday") + "\n" + _fn("calDragStart") + """
+const cells = {
+  past_rest: cell({'data-date': '2026-09-21', 'data-cs': 'rest'}),
+  today_rest: cell({'data-date': '2026-09-23', 'data-cs': 'rest'}),
+  future_rest: cell({'data-date': '2026-09-26', 'data-cs': 'rest'}),
+};
+global.document = { querySelectorAll: () => Object.values(cells) };
+global.window = {};
+calDragStart(ev, '2026-09-24', 0);
+const out = {};
+for (const [k, c] of Object.entries(cells)) out[k] = c.cls.has('cal-dropping-valid');
+console.log(JSON.stringify(out));
+"""
+    assert _run(cal) == {"past_rest": False, "today_rest": True, "future_rest": True}
+    grid = _today("2026-09-23") + _DOM + _fn("_pgIsoMonday") + "\n" + _fn("pgDragStart") + """
+const cells = {
+  past_rest: cell({'data-pg-day': '2026-09-21', 'data-pg-rest': '1', 'data-pg-completed': '0'}),
+  past_planned: cell({'data-pg-day': '2026-09-22', 'data-pg-rest': '0', 'data-pg-completed': '0'}),
+  future_rest: cell({'data-pg-day': '2026-09-26', 'data-pg-rest': '1', 'data-pg-completed': '0'}),
+};
+global.document = { querySelectorAll: () => Object.values(cells) };
+global.window = { _planData: {} };
+pgDragStart(ev, '2026-09-24', 0);
+const out = {};
+for (const [k, c] of Object.entries(cells)) out[k] = c.cls.has('pg-dropping-valid');
+console.log(JSON.stringify(out));
+"""
+    assert _run(grid) == {"past_rest": False, "past_planned": False, "future_rest": True}

@@ -13896,6 +13896,14 @@ async def api_plan_move_session(request: Request):
                 {"error": "move must stay within the current ISO week (Mon-Sun)"},
                 400,
             )
+        # A day that has passed is a record of what was ridden, not a slot: a
+        # session dropped there would be "missed" the moment it lands, and the
+        # day it left becomes a rest stub. Moving a missed session FORWARD
+        # (a past source) stays allowed.
+        if dst_d < clock.today():
+            return JSONResponse(
+                {"error": "cannot move a session onto a day that has passed",
+                 "date": dst_iso}, 400)
 
         weeks_data = plan.get("weeks", [])
 
