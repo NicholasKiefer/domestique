@@ -33,6 +33,7 @@ for _env_candidate in [_USER_DATA / ".env", Path(__file__).parent / ".env",
 
 from training import fetch_wellness, fetch_activities, ICUCredentialsMissing
 from ride_storage import is_icu_stub  # v3.11.6 — one stub rule for every reader
+from ride_storage import wellness_value as _wv  # one empty-value rule, both wellness stores
 
 log = logging.getLogger(__name__)
 
@@ -418,13 +419,15 @@ def sync_wellness(days: int = 90, _snapshot=None) -> int:
                            raw_json    = excluded.raw_json""",
                     (
                         dt,
-                        w.get("ctl"),
-                        w.get("atl"),
-                        w.get("hrv"),
-                        w.get("restingHR"),
-                        w.get("sleepSecs"),
-                        w.get("sleepScore"),
-                        eftp,
+                        # Empty is NULL, so COALESCE keeps the stored value:
+                        # an hrv/restingHR/sleep of 0 is no reading either.
+                        _wv("ctl", w.get("ctl")),
+                        _wv("atl", w.get("atl")),
+                        _wv("hrv", w.get("hrv")),
+                        _wv("restingHR", w.get("restingHR")),
+                        _wv("sleepSecs", w.get("sleepSecs")),
+                        _wv("sleepScore", w.get("sleepScore")),
+                        _wv("eftp", eftp),
                         json.dumps(w),
                     ),
                 )

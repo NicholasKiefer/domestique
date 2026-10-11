@@ -140,3 +140,42 @@ def test_readings_intervals_icu_stops_sending_survive(fresh_db):
         "SELECT hrv, rhr, sleep_secs, ctl FROM wellness WHERE date = ?",
         (WELLNESS_DAY,)).fetchone()
     assert tuple(row) == (62.0, 44, 27000, 40.5)
+
+
+def test_a_zero_reading_is_no_reading(fresh_db):
+    """intervals.icu (or the device behind it) can send 0 for a reading it does
+    not have. Nobody has an HRV, a resting HR or a night's sleep of zero, and
+    every reader treats 0 as missing, so a 0 must not overwrite a value."""
+    _sync_wellness([{"id": WELLNESS_DAY, "hrv": 62.0, "restingHR": 44,
+                     "sleepSecs": 27000, "sleepScore": 81}])
+    _sync_wellness([{"id": WELLNESS_DAY, "hrv": 0, "restingHR": 0,
+                     "sleepSecs": 0, "sleepScore": 0}])
+    row = db.get_db().execute(
+        "SELECT hrv, rhr, sleep_secs, sleep_score FROM wellness WHERE date = ?",
+        (WELLNESS_DAY,)).fetchone()
+    assert tuple(row) == (62.0, 44, 27000, 81)
+
+
+# The day's JSON file is the second wellness store: readiness, the resting-HR
+# baseline and /api/wellness read it. The app's own wellness sync writes it
+# through persist_wellness, which replaced the whole file each time.
+
+def test_the_wellness_file_keeps_readings_a_sync_stops_sending(tmp_path):
+    import json
+    import ride_storage as rs
+    with patch.object(rs, "_wellness_dir", return_value=tmp_path):
+        rs.persist_wellness({"id": WELLNESS_DAY, "hrv": 60.0, "restingHR": 44,
+                             "sleepSecs": 27000, "ctl": 40.0,
+                             "sportInfo": [{"type": "Ride", "eftp": 250}]})
+        # Garmin fields withheld: null, zero, an empty list, then a bare day.
+        rs.persist_wellness({"id": WELLNESS_DAY, "hrv": None, "restingHR": 0,
+                             "sleepSecs": None, "ctl": 40.5, "sportInfo": []})
+        rs.persist_wellness({"id": WELLNESS_DAY})
+        day = json.loads((tmp_path / f"{WELLNESS_DAY}.json").read_text())
+        assert (day["hrv"], day["restingHR"], day["sleepSecs"]) == (60.0, 44, 27000)
+        assert day["sportInfo"] == [{"type": "Ride", "eftp": 250}]
+        assert day["ctl"] == 40.5, "intervals.icu's own numbers must still update"
+        # and a real new reading still replaces the stored one
+        rs.persist_wellness({"id": WELLNESS_DAY, "hrv": 71.0})
+        day = json.loads((tmp_path / f"{WELLNESS_DAY}.json").read_text())
+        assert day["hrv"] == 71.0 and day["restingHR"] == 44
