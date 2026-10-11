@@ -503,3 +503,34 @@ def test_dashboard_renders_badge_and_breakdown():
     assert "planned.execution" in html          # week-strip badge source
     assert "✓ ${Math.round(execBlock.score)}" in html  # ✓ NN badge
     assert "Execution <b" in html               # day-modal breakdown line
+
+
+# ── a widened band is judged against the planned file itself ────────────────
+# Planned warm-up, recoveries and cool-down sit below the band, and widening
+# the band raises the in-band share a faithful ride reaches. The file says
+# what a faithful ride looks like: its own in-band share is the target, and
+# time above/below the band counts only beyond the file's own.
+
+def test_an_exact_ride_of_a_widened_file_is_on_target_not_over():
+    # 5 x 5 min at 107 % (Z5, within 3 % of the Z4 line: the band takes in Z4)
+    segs = ([_seg(600, 0.50)] + [_seg(300, 1.07), _seg(180, 0.50)] * 5
+            + [_seg(600, 0.50)])
+    r = es.score_ride(_planned("vo2max", 60, 70),
+                      _ride(tss=70, tiz=_tiz(z1=2100, z4=600, z5=900)), "power",
+                      band_segments=segs)
+    i = r["components"]["intensity"]
+    assert i["band"] == ["z4", "z5", "z6"]
+    assert i["target_fraction"] == round(1500 / 3600, 3)
+    assert r["verdict"] == "on_target", r
+
+
+def test_an_interval_ride_done_harder_reads_over_not_under():
+    # 3 x 8 min at 92 % (on the Z3/Z4 line), long easy warm-up and recoveries.
+    segs = ([_seg(600, 0.50)] + [_seg(480, 0.92), _seg(240, 0.50)] * 3
+            + [_seg(600, 0.50)])
+    harder = _tiz(z1=1920, z4=720, z5=720)       # half of each interval in Z5
+    r = es.score_ride(_planned("threshold", 56, 70), _ride(dur_s=3360, tss=80, tiz=harder),
+                      "power", band_segments=segs)
+    i = r["components"]["intensity"]
+    assert i["direction"] == "above", i
+    assert r["verdict"] == "over", r

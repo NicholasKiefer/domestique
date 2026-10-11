@@ -219,12 +219,42 @@ def _edge_widened(band: "tuple[int, ...]", segments) -> "tuple[int, ...]":
     return tuple(sorted(out))
 
 
+def _planned_split(band: "tuple[int, ...]", segments) -> "tuple[float, float, float] | None":
+    """Shares of the planned file's time (in band, above it, below it), per
+    second as _edge_widened reads it; None without a usable timeline."""
+    lo_z, hi_z = min(band), max(band)
+    n = inside = above = 0
+    for seg in segments or ():
+        a, b, d = seg.get("lo"), seg.get("hi"), int(seg.get("dur_s") or 0)
+        if a is None or b is None:
+            continue
+        for i in range(d):
+            z = _zone_of(float(a) + (float(b) - float(a)) * (i / (d - 1) if d > 1 else 0.0))
+            n += 1
+            inside += lo_z <= z <= hi_z
+            above += z > hi_z
+    if not n:
+        return None
+    return inside / n, above / n, (n - inside - above) / n
+
+
 def _intensity_axis(tiz: "dict[int, float]", zones: "tuple[int, ...]",
-                    expected: float, frame: str) -> dict:
+                    expected: float, frame: str, planned=None) -> dict:
+    """``planned``: _planned_split of the planned file over ``zones``, when the
+    file is known. Then the file says what a faithful ride looks like: the
+    expected in-band share is the file's own (a widened band would otherwise
+    read an exact ride as "over"), and the direction compares the ride's time
+    above and below the band with the file's (planned warm-up and recoveries
+    sit below the band, so raw totals called a harder interval ride "below")."""
     total = sum(tiz.values())
     in_band = sum(tiz.get(z, 0.0) for z in zones)
     above = sum(v for z, v in tiz.items() if z > max(zones))
     below = sum(v for z, v in tiz.items() if z < min(zones))
+    if planned is not None and total > 0:
+        p_in, p_above, p_below = planned
+        if p_in > 0:
+            expected = round(p_in, 3)
+        above, below = above / total - p_above, below / total - p_below
     fraction = in_band / total if total > 0 else 0.0
     ratio = (fraction / expected) if expected > 0 else 0.0
     return {
@@ -359,7 +389,11 @@ def score_ride(planned: dict, ride: dict, mode: str, *,
             basis = "power"
             # FTP tests keep their protocol-calibrated band (W1a above).
             band = zones if stype == "ftp_test" else _edge_widened(zones, band_segments)
-            intensity = _intensity_axis(power_tiz, band, expected, "power")
+            # A widened band is judged against the planned file itself.
+            planned_split = (_planned_split(band, band_segments)
+                             if tuple(band) != tuple(zones) else None)
+            intensity = _intensity_axis(power_tiz, band, expected, "power",
+                                        planned=planned_split)
         elif hr_tiz is not None and min(zones) <= 4:
             # HR-guidable band only — z5+ prescriptions are RPE in hr mode
             # (hr_targets returns RPE for zone >= 5), so HR TiZ can't grade
