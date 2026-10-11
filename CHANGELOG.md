@@ -1,5 +1,15 @@
 # Changelog
 
+## v3.12.1 — Setup that finishes, scores that read right, data that stays (2026-10-11)
+
+- **Fixed: setup could not connect intervals.icu, or finish at all, when the app had no profile.** After the last profile was deleted, the app opened the first-run setup with no profile behind it: every intervals.icu sign-in ended in "Couldn't link your account — please try again" after a correct email and password, and finishing without intervals.icu failed too. Setup now creates your profile before it signs in or saves. Reported in [#24](https://github.com/platypus45/domestique/issues/24).
+- **When linking intervals.icu fails, setup says why.** The setup screens showed the same "please try again" for every failure; they now say which step went wrong (declined, an expired sign-in, a rejected code, no connection, and so on), as the dashboard already did.
+- **Fixed: a sync could erase what only you had entered.** Marking a ride as a race was undone by the next sync, and an HRV value you typed in yourself was wiped the next time intervals.icu sent that day without one. A sync now only replaces what intervals.icu actually sends, and an empty value from intervals.icu never overwrites a stored one. That also keeps your HRV, resting heart rate and sleep history if intervals.icu stops passing on Garmin's wellness data, which it has said may happen soon ([#29](https://github.com/platypus45/domestique/issues/29)). Found by a contributor.
+- **Fixed: an easy Z2 ride labelled "Polarized, confidence 100%".** A ride with a few seconds of tempo and nothing hard counted as polarized. A ride is now only called polarized when it has a real hard part: more time hard than in the middle zones.
+- **Fixed: a workout ridden a little harder than prescribed read as "intensity 46% (under)".** The intensity score counts the time you spent in the workout's zones. Endurance workouts that sit right at the top of Z2 (75% of FTP) spill into Z3 at the slightest push, so riding one 5% up scored as if you had ridden it far too easy, and even riding it exactly lost points. When a workout's targets sit on a zone line, the zone on the other side now counts too. When your time outside the zones was above them, the day view says "above its zones" and the verdict reads "over", never "under". FTP tests are graded as before. Rides already scored keep their score until you use "rematch" on that day. Reported in [#26](https://github.com/platypus45/domestique/issues/26).
+- **Fixed: "Download CRS" did nothing on Windows and Linux.** Course files now open a save dialog, the same way workout downloads do.
+- **You can drop a workout on a rest day, so a move can be undone.** Dragging a workout onto one of your rest days now works when life moves your training, and a workout moved by mistake can be dragged back to the day it came from. Days you marked unavailable still don't take a workout.
+
 ## v3.12.0 — One plan, everywhere (2026-09-19)
 
 The planner core is rebuilt on the work of a contributor's fork (taladjidi/domestique), brought upstream in one reviewed merge. What you see:
