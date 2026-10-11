@@ -109,3 +109,12 @@ def test_the_drift_rule_still_applies_over_an_estimate(pm):
     assert out and out["applied"] and out["new_ftp"] == 262
     assert (pm.ftp, pm.ftp_source) == (262, "eftp_auto")
     assert [h for h in pm.ftp_test_history if h.get("source") == "eftp_auto"]
+
+
+def test_an_unknown_source_on_record_does_not_block_a_write(pm):
+    """A hand-edited or older athlete.json can carry an ftp_source the gate
+    does not know. A write that offers no source keeps the one on record; an
+    unknown one counts as the rider's own, never as a reason to raise."""
+    pm._athlete["ftp_source"] = "icu"
+    assert pm.update_ftp(250) is not False
+    assert (pm.ftp, pm.ftp_source) == (250, "manual")

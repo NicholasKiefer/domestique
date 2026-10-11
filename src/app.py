@@ -13303,8 +13303,13 @@ def api_plan_daily_adapt():
         # form is below -30 -- could never fire on the only path that calls
         # it: the parameter defaulted to None and the branch was dead in
         # production while every card on the page showed the number.
-        _unchanged, info = tp.daily_adapt_plan(
-            current_week, actual, today, tsb=_fitness_state()["tsb"])
+        try:
+            tsb = _fitness_state()["tsb"]
+        except Exception:
+            # Form unknown is not a failed projection: no de-load, as before.
+            _log.debug("daily-adapt: fitness state unavailable", exc_info=True)
+            tsb = None
+        _unchanged, info = tp.daily_adapt_plan(current_week, actual, today, tsb=tsb)
         info["projection_only"] = True  # defensive: re-mark in case caller strips
         return info
 

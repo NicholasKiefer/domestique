@@ -1066,7 +1066,9 @@ class ProfileManager:
             # No provenance offered: keep whatever is on record, and write
             # through the same path so the gate still applies.
             source = str(self._athlete.get("ftp_source") or "manual")
-        elif source not in _FACTS["ftp"].prio:
+        if source not in _FACTS["ftp"].prio:
+            # An unknown source, offered or on record (a hand-edited or older
+            # athlete.json), is the rider's: never a reason to refuse the write.
             source = "manual"
         return self._set_fact("ftp", v, source)
 
