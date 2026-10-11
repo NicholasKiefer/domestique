@@ -260,14 +260,48 @@ class TestWizardWithNoProfile:
         assert first == again
         assert len(stub.pm.list_profiles()) == 1
 
-    def test_profiles_on_disk_but_none_active_activates_the_first(self, stub):
-        a = stub.pm.create_profile("Anna")
+    def test_profiles_on_disk_but_none_active_go_to_the_picker(self, stub):
+        """Each profile on disk belongs to a rider. Handing one to the
+        first-run wizard let its save overwrite that rider's settings and its
+        link to another intervals.icu account purge their synced data."""
+        stub.pm.create_profile("Anna")
         stub.pm.create_profile("Ben")
         assert stub.pm.active_id is None
+        assert stub.client.get("/", follow_redirects=False).headers["location"] \
+            == "/profile-picker"
         r = stub.client.post("/api/setup/ensure-profile")
-        db_module._sync_stop.clear()
-        assert r.json()["id"] == a and stub.pm.active_id == a
+        assert r.status_code == 409, r.text
+        assert r.json()["redirect"] == "/profile-picker"
+        assert stub.pm.active_id is None
         assert len(stub.pm.list_profiles()) == 2
+
+    def test_the_wizard_cannot_reach_another_riders_profile(self, stub):
+        """A configured profile with synced data, no active pointer (a stored
+        null): neither the wizard's save nor its link may touch it."""
+        a = _active_profile(stub, "Anna")
+        stub.pm.save_icu_token("T_ANNA", "i_anna", "Anna")
+        assert stub.client.post("/api/setup/save", json={"ftp": 300}).status_code == 200
+        _seed_synced_data(stub, a)
+        with stub.pm._switch_lock:          # the state a stored null leaves
+            stub.pm._active_id = None
+            stub.pm._registry["active_profile"] = None
+        assert stub.client.post("/api/setup/ensure-profile").status_code == 409
+        assert stub.client.post("/api/setup/save", json={"ftp": 200}).status_code == 409
+        r = stub.client.get("/oauth/icu/start?return_to=%2Fsetup", follow_redirects=False)
+        m = re.search(r"state=([^&]+)", r.headers.get("location", ""))
+        if m:
+            with mock.patch("httpx.post", side_effect=_fake_exchange()):
+                stub.client.get(f"/oauth/icu/callback?code=BEN&state={m.group(1)}",
+                                follow_redirects=False)
+        assert _athlete_on_disk(stub, a).get("ftp") == 300
+        assert _counts(stub, a) == (1, 1, 1)
+        assert _env_on_disk(stub, a).get("ICU_ACCESS_TOKEN") == "T_ANNA"
+
+    def test_the_wizard_follows_a_409_to_the_picker(self):
+        src = (REPO / "src" / "templates" / "setup.html").read_text(encoding="utf-8")
+        ens = src[src.index("async function _ensureProfile"):]
+        ens = ens[:ens.index("\n}\n")]
+        assert "r.status === 409" in ens and "'/profile-picker'" in ens
 
     def test_the_wizard_asks_for_a_profile_before_linking_and_saving(self):
         src = (REPO / "src" / "templates" / "setup.html").read_text(encoding="utf-8")

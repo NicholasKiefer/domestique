@@ -1251,6 +1251,10 @@ def setup_ensure_profile():
     from migrate_profiles import default_profile_name
     try:
         pid = ProfileManager.get().ensure_active_profile(default_profile_name())
+    except LookupError:
+        # Profiles exist, none active: never hand one of them to the wizard.
+        return JSONResponse({"error": "choose_profile", "redirect": "/profile-picker"},
+                            status_code=409)
     except db.SyncBusy:
         return JSONResponse({"error": "sync busy — try again in a moment"},
                             status_code=503)
@@ -20184,6 +20188,10 @@ def dashboard(request: Request):
         # legacy upgrades are marked bootstrapped=false by the migration — a
         # real install provably never redirects.
         if pm.active_id is None:
+            # Profiles on disk but none active (a stored null pointer): the
+            # rider chooses one. The first-run wizard is for no profile at all.
+            if pm.list_profiles():
+                return RedirectResponse(url="/profile-picker")
             return RedirectResponse(url="/setup")
         if (_active_profile_entry(pm).get("bootstrapped")
                 and not _setup_marker().exists()):

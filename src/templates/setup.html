@@ -780,6 +780,9 @@ async function connectIcu() {
 async function _ensureProfile() {
   try {
     const r = await fetch('/api/setup/ensure-profile', {method: 'POST'});
+    // 409: profiles exist but none is active. They belong to riders; the
+    // wizard never writes into one, the rider picks it instead.
+    if (r.status === 409) { window.location.href = '/profile-picker'; return 409; }
     return r.ok ? true : r.status;
   } catch (_) { return 0; }
 }
