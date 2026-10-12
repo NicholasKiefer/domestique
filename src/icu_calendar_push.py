@@ -21,8 +21,23 @@ Contract highlights (GRILL OUTCOME — LOCKED, /tmp/IP_ICU_PUSH.md):
     route through training._get (it maps 403 to ICUServerError).
   - Orphan sweep: only events whose external_id carries OUR profile prefix
     are ever deleted (G5); foreign "domestique:" prefixes are warned about,
-    never touched (G-B). Sweep is skipped when the upsert failed. The window
-    starts TODAY — past-day events are never touched (G-H).
+    never touched (G-B). Sweep is skipped when the upsert failed. Deletes and
+    re-dates never touch past days, and the sweep only considers events
+    dated [today, today+horizon] (G-H); the read window looks 7 days back
+    and 7 days past the horizon (#28) so a workout the rider moved in
+    intervals.icu stays visible (one moved further out is invisible and
+    still re-dated by the upsert — status quo).
+  - Rider moves in intervals.icu (#28, step 1 — reconcile never writes the
+    plan): our event dated on another day than the one in its external_id
+    was moved by the rider. Unless the plan agrees with the move (a session
+    on that date moved from the encoded day, same workout), the id is HELD:
+      * no visible re-date of a rider-moved event (never in the upsert);
+      * a rider-moved event is never deleted by reconcile unless the plan
+        agrees with the move;
+      * one event per session: the session a held event stands for is not
+        pushed anywhere else (found through its moved_from chain); no bumped
+        id is ever minted.
+  - One reconcile / sweep_all at a time (module lock; 60 s, then "busy").
   - Toast counts derive from the local diff vs the pre-upsert GET, not from
     ICU response fields (G-G).
   - apikey auth = always write-capable (G-F); OAuth needs the CALENDAR:WRITE
@@ -33,9 +48,11 @@ from __future__ import annotations
 
 import clock  # the one clock every module reads (see src/clock.py)
 import base64
+import functools
 import json
 import logging
 import re
+import threading
 import urllib.error
 import urllib.request
 import tls_trust  # v3.11.4 — one verifier for every intervals.icu connection
@@ -49,6 +66,13 @@ from user_home import domestique_home
 _log = logging.getLogger("domestique.icu_push")
 
 HORIZON_DAYS = 14
+# #28: reconcile reads this far either side of [today, today+horizon] so an
+# event the rider moved just before today (rode it early) or just past the
+# horizon is still seen — and held — instead of being yanked back blind by
+# the upsert. The sweep never looks outside [today, today+horizon].
+_LOOKBACK_DAYS = 7
+_LOOKAHEAD_DAYS = 7
+_MAX_CHAIN_HOPS = 7
 _ID_ROOT = "domestique:"
 # calendar-push (2026-07-07): a DISTINCT root for user-initiated LIBRARY pushes
 # (the workout-detail "Send to intervals.icu calendar" button). Load-bearing on
@@ -271,6 +295,20 @@ def _build_event(s: dict, ext_id: str, pm, classifications: dict,
     }, None
 
 
+def _sessions_by_day(plan: dict) -> dict[str, list[dict]]:
+    """Day → that day's sessions in stored plan order (weeks are ordered and a
+    day lives in exactly one week, so plain traversal preserves order). The
+    index in each list IS the external_id's <n>; #28's hold logic resolves
+    ids with this same enumeration, so it lives in one place."""
+    by_day: dict[str, list[dict]] = {}
+    for w in plan.get("weeks", []):
+        for s in w.get("sessions", []):
+            d = s.get("day")
+            if isinstance(d, str) and d:
+                by_day.setdefault(d, []).append(s)
+    return by_day
+
+
 def _desired_events(pm, plan: dict, today: date, horizon_days: int,
                     profile_id: str):
     """Collect the horizon's pushable sessions as ICU bulk-event payloads.
@@ -296,14 +334,7 @@ def _desired_events(pm, plan: dict, today: date, horizon_days: int,
     workout_dir = Path(_app.WORKOUT_DIR)
     classifications = _load_classifications(workout_dir)
 
-    # Day → that day's sessions in stored plan order (weeks are ordered and a
-    # day lives in exactly one week, so plain traversal preserves order).
-    by_day: dict[str, list[dict]] = {}
-    for w in plan.get("weeks", []):
-        for s in w.get("sessions", []):
-            d = s.get("day")
-            if isinstance(d, str) and d:
-                by_day.setdefault(d, []).append(s)
+    by_day = _sessions_by_day(plan)
 
     events, skipped, broken_ids = [], [], set()
     for day_iso in sorted(by_day):
@@ -369,11 +400,16 @@ def _connection(pm):
     return aid, None
 
 
-def _get_window_events(athlete_id: str, today: date, horizon_days: int):
-    """GET our reconcile window. Returns (events|None, error_result|None)."""
-    newest = today + timedelta(days=horizon_days)
+def _get_window_events(athlete_id: str, today: date, horizon_days: int,
+                       lookback: int = 0, lookahead: int = 0):
+    """GET our reconcile window. Returns (events|None, error_result|None).
+
+    lookback/lookahead widen the READ only (#28: reconcile passes 7/7 to see
+    rider moves); sweep_all keeps the defaults, i.e. [today, today+horizon]."""
+    oldest = today - timedelta(days=lookback)
+    newest = today + timedelta(days=horizon_days + lookahead)
     status, body = _http(
-        "GET", f"athlete/{athlete_id}/events?oldest={today.isoformat()}"
+        "GET", f"athlete/{athlete_id}/events?oldest={oldest.isoformat()}"
                f"&newest={newest.isoformat()}")
     if _scope_403(status, body):
         return None, _result(needs_reconnect=True)
@@ -393,9 +429,14 @@ def _get_window_events(athlete_id: str, today: date, horizon_days: int):
     return events, None
 
 
-def _ours_in_window(events: list, profile_id: str, today: date) -> dict:
+def _ours_in_window(events: list, profile_id: str, today: date,
+                    last_day: date | None = None) -> dict:
     """Our profile's events keyed by external_id — and the G-B warning for
-    foreign domestique prefixes (multi-install: warn, NEVER delete)."""
+    foreign domestique prefixes (multi-install: warn, NEVER delete).
+
+    ``last_day`` clamps the far end (#28): reconcile's read reaches past the
+    horizon, but an event dated there (a planner push-workout, a rider move)
+    must never become a sweep candidate."""
     prefix = f"{_ID_ROOT}{profile_id}:"
     ours: dict[str, dict] = {}
     foreign = 0
@@ -418,6 +459,8 @@ def _ours_in_window(events: list, profile_id: str, today: date) -> dict:
             continue
         if ev_day < today:
             continue
+        if last_day is not None and ev_day > last_day:
+            continue
         ours[eid] = ev
     if foreign:
         _log.warning(
@@ -427,11 +470,157 @@ def _ours_in_window(events: list, profile_id: str, today: date) -> dict:
     return ours
 
 
+# ── rider moves made in intervals.icu (#28, step 1: hold, never fight) ───────
+
+def _stem(name) -> str:
+    """Workout identity across formats: an hr profile pushes ``x.fit`` for the
+    session's ``x.zwo``, so files compare by stem."""
+    return Path(str(name or "").strip()).stem
+
+
+def _is_stub(s: dict) -> bool:
+    return str(s.get("status") or "").startswith("moved_from:")
+
+
+def _iso_week(day_iso: str):
+    try:
+        return date.fromisoformat(day_iso).isocalendar()[:2]
+    except ValueError:
+        return None
+
+
+def _event_day(ev: dict) -> date | None:
+    try:
+        return date.fromisoformat(str(ev.get("start_date_local") or "")[:10])
+    except ValueError:
+        return None
+
+
+def _plan_agrees(by_day: dict, enc: str, ev_day: str, ev: dict) -> bool:
+    """grill_simple C1 + grill_data M4: the plan made the same move when a
+    session on the event's day was moved from the encoded day — and, when
+    both sides name a file, it is the same workout (a #27 swap followed by
+    an intervals.icu stack must not look agreed)."""
+    want = _stem(ev.get("filename"))
+    for s in by_day.get(ev_day) or []:
+        if s.get("moved_from") != enc:
+            continue
+        have = _stem(s.get("zwo_file"))
+        if not want or not have or want == have:
+            return True
+    return False
+
+
+def _held_ids(events: list, by_day: dict, profile_id: str,
+              today: date) -> dict:
+    """external_id → (encoded day, n, the moved copy) for every id of ours the
+    rider moved in intervals.icu and the plan has not followed.
+
+    Read from the RAW GET list (an intervals.icu copy can share our id; the
+    ``ours`` dict keeps one copy per id). Only ids that strictly match our
+    profile's ``domestique:<pid>:<YYYY-MM-DD>:<n>`` count — never
+    ``domestique-manual:``, never another profile. An unparseable event date
+    is not a move (legacy fail-closed behaviour). Every writer of these ids
+    writes date == encoded day, so a different date is the rider's move."""
+    pattern = re.compile(re.escape(f"{_ID_ROOT}{profile_id}:")
+                         + r"([0-9]{4}-[0-9]{2}-[0-9]{2}):([0-9]+)")
+    groups: dict[str, tuple] = {}
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        eid = str(ev.get("external_id") or "")
+        m = pattern.fullmatch(eid)
+        if m is None or _iso_week(m.group(1)) is None:
+            continue
+        groups.setdefault(eid, (m.group(1), int(m.group(2)), []))[2].append(ev)
+    held = {}
+    for eid, (enc, n, evs) in groups.items():
+        moved = [(ev, d) for ev, d in ((ev, _event_day(ev)) for ev in evs)
+                 if d is not None and d.isoformat() != enc]
+        if not moved:
+            continue
+        ev, d = moved[0]
+        # A copy (two events, one id) is never agreed: either upsert or
+        # delete could hit the rider's copy. A move into the past is never
+        # agreed either: following it would re-date a past (possibly
+        # ride-paired) event on a swap — past days are never re-dated.
+        if len(evs) == 1 and d >= today and _plan_agrees(
+                by_day, enc, d.isoformat(), ev):
+            continue
+        held[eid] = (enc, n, ev)
+    return held
+
+
+def _resolve_moved_session(by_day: dict, enc: str, n: int, ev: dict):
+    """(day, index) where the plan now holds the session a held event was
+    pushed for, or None (grill_cal C-1, prototype R1).
+
+    A stub ``moved_from:X`` on the encoded day leads to X's row that came
+    from there (or X's own stub when it moved on again), hop by hop, never
+    revisiting a day. No stub means a #27 swap or a later move refilled the
+    slot: the session is the one in that ISO week that left the encoded day
+    with the event's workout — without an echoed filename it cannot be told
+    apart, so nothing is resolved."""
+    slot = by_day.get(enc) or []
+    s = slot[n] if n < len(slot) else None
+    if s is None:
+        return None
+    if not _is_stub(s):
+        want = _stem(ev.get("filename"))
+        if not want:
+            return None
+        week = _iso_week(enc)
+        hits = [(d, k) for d, ss in by_day.items() if _iso_week(d) == week
+                for k, x in enumerate(ss)
+                if not _is_stub(x) and x.get("moved_from") == enc
+                and _stem(x.get("zwo_file")) == want]
+        return hits[0] if len(hits) == 1 else None
+    prev, seen = enc, {enc}
+    for _ in range(_MAX_CHAIN_HOPS):
+        nxt = str(s.get("status"))[len("moved_from:"):]
+        if nxt in seen:
+            return None
+        seen.add(nxt)
+        hits = [(k, x) for k, x in enumerate(by_day.get(nxt) or [])
+                if x.get("moved_from") == prev or _is_stub(x)]
+        if len(hits) != 1:
+            return None
+        k, s = hits[0]
+        if not _is_stub(s):
+            return nxt, k
+        prev = nxt
+    return None
+
+
+# #28 (grill_cal M-3): the sync thread, the 30 s debounce timer and the Push
+# button can each start a reconcile; two overlapping bulk upserts of a new
+# external_id could leave two events under one id. One run at a time.
+_RECONCILE_LOCK = threading.Lock()
+_RECONCILE_LOCK_TIMEOUT_S = 60.0
+
+
+def _one_at_a_time(fn):
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        if not _RECONCILE_LOCK.acquire(timeout=_RECONCILE_LOCK_TIMEOUT_S):
+            _log.warning("EVENT=icu_calendar_busy fn=%s", fn.__name__)
+            return _result(error="busy")
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _RECONCILE_LOCK.release()
+    return run
+
+
+@_one_at_a_time
 def reconcile(horizon_days: int = HORIZON_DAYS) -> dict:
     """Mirror [today, today+horizon] of the stored plan onto the ICU calendar.
 
-    Returns {pushed, updated, deleted, skipped:[{day,reason}]} plus at most
-    one of needs_reconnect / needs_lthr / error. Never raises.
+    Returns {pushed, updated, deleted, skipped:[{day,reason}], held} plus at
+    most one of needs_reconnect / needs_lthr / error ("busy" when another
+    run held the lock for a minute). ``held`` counts our events left where
+    the rider moved them in intervals.icu (#28). Never raises; never writes
+    the plan.
     """
     from profile_manager import ProfileManager
     try:
@@ -456,11 +645,30 @@ def reconcile(horizon_days: int = HORIZON_DAYS) -> dict:
 
         # GET BEFORE the upsert: one call feeds both the G-G count diff
         # (pre-push state) and the orphan sweep candidate list.
-        existing, err_res = _get_window_events(athlete_id, today, horizon_days)
+        existing, err_res = _get_window_events(
+            athlete_id, today, horizon_days, _LOOKBACK_DAYS, _LOOKAHEAD_DAYS)
         if err_res is not None:
             err_res["skipped"] = skipped
             return err_res
-        ours = _ours_in_window(existing, profile_id, today)
+        ours = _ours_in_window(existing, profile_id, today,
+                               today + timedelta(days=horizon_days))
+
+        # #28 step 1: a move the rider made in intervals.icu is HELD — its id
+        # is never upserted (no tug-of-war back to the planned day) and never
+        # swept (it is no longer deleted the next morning). The session it
+        # stands for is not pushed anywhere else either, so a later
+        # auto-reschedule or swap cannot put the workout on two days.
+        by_day = _sessions_by_day(plan)
+        held = _held_ids(existing, by_day, profile_id, today)
+        result["held"] = len(held)
+        if held:
+            stand_ins = set(held)
+            for enc, n, ev in held.values():
+                loc = _resolve_moved_session(by_day, enc, n, ev)
+                if loc is not None:
+                    stand_ins.add(f"{_ID_ROOT}{profile_id}:{loc[0]}:{loc[1]}")
+            desired = [ev for ev in desired
+                       if ev["external_id"] not in stand_ins]
 
         # ONE bulk upsert (idempotent: keyed by external_id, G1).
         if desired:
@@ -496,10 +704,10 @@ def reconcile(horizon_days: int = HORIZON_DAYS) -> dict:
                   or (prev.get("filename") and str(prev["filename"]) != ev["filename"])):
                 result["updated"] += 1
 
-        # Orphan sweep — ours minus (desired ∪ broken). Skipped entirely when
-        # the upsert failed (returns above); broken sessions keep their prior
-        # event rather than losing it to a build hiccup.
-        protected = desired_ids | broken_ids
+        # Orphan sweep — ours minus (desired ∪ broken ∪ held). Skipped
+        # entirely when the upsert failed (returns above); broken sessions
+        # keep their prior event rather than losing it to a build hiccup.
+        protected = desired_ids | broken_ids | set(held)
         orphans = [ev for eid, ev in ours.items() if eid not in protected]
         if orphans:
             status, body = _http(
@@ -519,21 +727,23 @@ def reconcile(horizon_days: int = HORIZON_DAYS) -> dict:
                     "orphan_sweep", status, body)
         _log.info(
             "EVENT=icu_calendar_push pushed=%d updated=%d deleted=%d "
-            "skipped=%d horizon=%dd",
+            "skipped=%d held=%d horizon=%dd",
             result["pushed"], result["updated"], result["deleted"],
-            len(skipped), horizon_days)
+            len(skipped), len(held), horizon_days)
         return result
     except Exception as e:                      # G4: zero 500s, ever
         _log.exception("icu calendar reconcile failed")
         return _result(error=f"internal:{type(e).__name__}")
 
 
+@_one_at_a_time
 def sweep_all(horizon_days: int = HORIZON_DAYS) -> dict:
     """G-A: delete ALL of our pushed events in [today, today+horizon].
 
     Used when the sync toggle turns OFF and (best-effort, BEFORE the token
-    purge) on disconnect. Only our profile-prefixed events are touched.
-    Never raises."""
+    purge) on disconnect. Only our profile-prefixed events are touched —
+    held rider moves included (toggle off means everything ours goes; its
+    window is deliberately not widened by #28). Never raises."""
     from profile_manager import ProfileManager
     try:
         pm = ProfileManager.get()
