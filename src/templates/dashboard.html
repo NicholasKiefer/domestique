@@ -16627,6 +16627,8 @@ function icuPushToastFromResult(r, verb) {
   let msg = parts.length ? (verb + ': ' + parts.join(' · ')) : (verb + ': calendar already up to date');
   const nSkip = (r.skipped || []).length;
   if (nSkip) msg += ' · ' + nSkip + ' skipped';
+  // #28: workouts the rider moved in intervals.icu are left there on purpose.
+  if (r.held > 0) msg += ' · ' + r.held + ' left where you moved it in intervals.icu';
   showToast(msg, 5000, 'success');
 }
 
