@@ -1,5 +1,15 @@
 # Changelog
 
+## v3.12.2 — Your profile and your FTP stay yours (2026-10-12)
+
+- **Fixed (important): first-run setup could take over another rider's profile.** If a profile was deleted twice, for example by a double click or from two open windows, the app could be left with riders on disk but none selected. It then opened first-run setup on top of one of those riders' profiles. Finishing setup overwrote that rider's settings, and linking a different intervals.icu account erased their synced rides and wellness. This came in with 3.12.1's setup fix. Deleting a profile that's already gone now does nothing, and with riders on disk but none selected, the app sends you to the profile picker. Found by a contributor.
+- **Fixed: an FTP you tested or typed could be replaced by an estimate.** The automatic seven-day eFTP rule could overwrite a tested FTP within two syncs. An estimate now never replaces a number you tested or entered yourself.
+- **Fixed: a saved FTP didn't always show everywhere.** After one manual save, the FTP shown stopped following profile switches until a restart, and some screens could show an old number next to zones built on the new one.
+- **The daily plan check now knows your form.** Its rule to ease hard days when you're very fatigued could never fire, because your form was never passed to it. It now is.
+- **Fixed: an empty wellness reading could still erase a stored one.** 3.12.1 said an empty value from intervals.icu never overwrites a stored one, but that held in only one of the two places Domestique keeps wellness. Zero values (HRV 0, resting HR 0, sleep 0) also counted as readings. It now holds in both places, for empty and zero values, so readiness and your resting-HR baseline keep their history.
+- **Execution intensity, finished.** 3.12.1 counted the neighbouring zone when a workout's targets sit on a zone line, but a ride ridden exactly as planned could still read "over" or "under". The score now compares the ride with the planned workout's own time in and around its zones, so riding it as planned reads on target. Workouts that don't sit on a zone line score exactly as before.
+- **A day that has passed no longer takes a dropped workout.** Since 3.12.1, rest days accept a dropped workout, and that included rest days earlier in the current week. A missed workout can still be moved forward.
+
 ## v3.12.1 — Setup that finishes, scores that read right, data that stays (2026-10-11)
 
 - **Fixed: setup could not connect intervals.icu, or finish at all, when the app had no profile.** After the last profile was deleted, the app opened the first-run setup with no profile behind it: every intervals.icu sign-in ended in "Couldn't link your account — please try again" after a correct email and password, and finishing without intervals.icu failed too. Setup now creates your profile before it signs in or saves. Reported in [#24](https://github.com/platypus45/domestique/issues/24).
