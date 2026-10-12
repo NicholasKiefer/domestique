@@ -13295,7 +13295,10 @@ function pgDragStart(e, srcDay, srcWeekIdx) {
     const isUnavailable = !!av && Number(av.hours) === 0;
     const cellMonday = _pgIsoMonday(day);
     const sameWeek = cellMonday && (cellMonday === srcMonday);
-    if (sameWeek && !isCompleted && !isUnavailable) {
+    // A day that has passed is a record, not a slot (the move endpoint
+    // refuses it too).
+    const isPast = day < new Date().toLocaleDateString('en-CA');
+    if (sameWeek && !isCompleted && !isUnavailable && !isPast) {
       c.classList.add('pg-dropping-valid');
     } else {
       c.classList.add('pg-dropping-invalid');
@@ -14812,7 +14815,10 @@ function calDragStart(e, srcDay, srcWeekIdx) {
     const isUnavailable = c.getAttribute('data-cs') === 'future_unavailable';
     const cellMonday = _calIsoMonday(day);
     const sameWeek = cellMonday && (cellMonday === srcMonday);
-    if (sameWeek && !isRest && !isCompleted && !isMissing && !isUnavailable) {
+    // A day that has passed is a record, not a slot (the move endpoint
+    // refuses it too).
+    const isPast = day < new Date().toLocaleDateString('en-CA');
+    if (sameWeek && !isRest && !isCompleted && !isMissing && !isUnavailable && !isPast) {
       c.classList.add('cal-dropping-valid');
     } else {
       c.classList.add('cal-dropping-invalid');

@@ -1251,6 +1251,10 @@ def setup_ensure_profile():
     from migrate_profiles import default_profile_name
     try:
         pid = ProfileManager.get().ensure_active_profile(default_profile_name())
+    except LookupError:
+        # Profiles exist, none active: never hand one of them to the wizard.
+        return JSONResponse({"error": "choose_profile", "redirect": "/profile-picker"},
+                            status_code=409)
     except db.SyncBusy:
         return JSONResponse({"error": "sync busy — try again in a moment"},
                             status_code=503)
@@ -1751,7 +1755,10 @@ def api_profiles_update(profile_id: str, body: dict):
     from profile_manager import ProfileManager
     _validate_profile_id(profile_id)
     pm = ProfileManager.get()
-    pm.update_profile(profile_id, name=body.get("name"), color=body.get("color"))
+    try:
+        pm.update_profile(profile_id, name=body.get("name"), color=body.get("color"))
+    except LookupError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
     return {"ok": True}
 
 
@@ -1762,6 +1769,8 @@ def api_profiles_delete(profile_id: str):
     pm = ProfileManager.get()
     try:
         pm.delete_profile(profile_id)
+    except LookupError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     return {"ok": True}
@@ -13887,6 +13896,14 @@ async def api_plan_move_session(request: Request):
                 {"error": "move must stay within the current ISO week (Mon-Sun)"},
                 400,
             )
+        # A day that has passed is a record of what was ridden, not a slot: a
+        # session dropped there would be "missed" the moment it lands, and the
+        # day it left becomes a rest stub. Moving a missed session FORWARD
+        # (a past source) stays allowed.
+        if dst_d < clock.today():
+            return JSONResponse(
+                {"error": "cannot move a session onto a day that has passed",
+                 "date": dst_iso}, 400)
 
         weeks_data = plan.get("weeks", [])
 
@@ -20179,6 +20196,10 @@ def dashboard(request: Request):
         # legacy upgrades are marked bootstrapped=false by the migration — a
         # real install provably never redirects.
         if pm.active_id is None:
+            # Profiles on disk but none active (a stored null pointer): the
+            # rider chooses one. The first-run wizard is for no profile at all.
+            if pm.list_profiles():
+                return RedirectResponse(url="/profile-picker")
             return RedirectResponse(url="/setup")
         if (_active_profile_entry(pm).get("bootstrapped")
                 and not _setup_marker().exists()):

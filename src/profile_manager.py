@@ -461,6 +461,11 @@ class ProfileManager:
             # wizard. Otherwise blocking here traps the user when they've
             # decided to purge everything.
             profiles = self._registry.get("profiles", [])
+            # Contract 7.1: an id the registry does not list changes nothing.
+            # "Last profile" below is counted from the registry, so a repeated
+            # DELETE of an already-deleted id used to clear the active pointer.
+            if not any(p.get("id") == profile_id for p in profiles):
+                raise LookupError(f"Profile '{profile_id}' not found")
             is_last = len(profiles) <= 1
             if profile_id == self._active_id and not is_last:
                 raise ValueError("Cannot delete active profile")
@@ -522,6 +527,8 @@ class ProfileManager:
                     if color is not None:
                         p["color"] = color
                     break
+            else:
+                raise LookupError(f"Profile '{profile_id}' not found")
             self._save_registry()
 
     def ensure_active_profile(self, name: str) -> str:
@@ -530,23 +537,27 @@ class ProfileManager:
         The first-run wizard writes into the active profile (the intervals.icu
         link, the final save), and it is also where / sends a rider after the
         last profile was deleted (AC6a clears the pointer). With no profile
-        every link ended in profile_gone (#24) and every save in 409. Profiles
-        on disk but none active: the first, as _rebuild_registry picks. None at
-        all: a new one, bootstrapped like the profile migrate_to_profiles
-        makes on a fresh install, so / keeps routing to the wizard until it
-        is saved. May raise db.SyncBusy from switch()."""
+        every link ended in profile_gone (#24) and every save in 409. No
+        profile at all: a new one, bootstrapped like the profile
+        migrate_to_profiles makes on a fresh install, so / keeps routing to
+        the wizard until it is saved.
+
+        Profiles on disk but none active: LookupError, nothing changes. Each
+        of them belongs to a rider; adopting one here hands it to the
+        first-run wizard, whose save overwrites its settings and whose link
+        to a different intervals.icu account purges its synced data. The
+        rider picks a profile on /profile-picker instead. May raise
+        db.SyncBusy from switch()."""
         with self._switch_lock:
             if self._active_id is not None:
                 return self._active_id
-            profiles = self.list_profiles()
-            if profiles:
-                pid = profiles[0]["id"]
-            else:
-                pid = self.create_profile(name)
-                for p in self._registry.get("profiles", []):
-                    if p.get("id") == pid:
-                        p["bootstrapped"] = True
-                self._save_registry()
+            if self.list_profiles():
+                raise LookupError("profiles exist but none is active; choose one")
+            pid = self.create_profile(name)
+            for p in self._registry.get("profiles", []):
+                if p.get("id") == pid:
+                    p["bootstrapped"] = True
+            self._save_registry()
             self.switch(pid)
             return pid
 
