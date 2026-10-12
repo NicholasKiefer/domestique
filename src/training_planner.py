@@ -12022,7 +12022,7 @@ def reforecast(
                     s.description = f"z2 ({new_dur}min) — restored from rest"
                     s.zwo_file = ""
                     s.zwo_name = ""
-                elif getattr(s, "user_swapped", False):
+                elif getattr(s, "user_swapped", False) or getattr(s, "user_moved", False):
                     # A pinned day — swap-type, accepted redraw, FTP-test
                     # choice — keeps the workout the rider chose. Applying the
                     # calendar hours literally here rescaled the duration and,
@@ -12030,6 +12030,10 @@ def reforecast(
                     # the rider's pick: the exact "I accepted one workout and
                     # got another" report. Unavailable (0h) still wins above —
                     # a day the rider zeroed is rest whatever was pinned.
+                    # #27: a session the rider dragged (or swapped onto this
+                    # day) keeps its length too. Every ride sync hands this
+                    # pass the whole availability calendar, so a long ride
+                    # moved onto a 1 h weekday was cut to 1 h the next morning.
                     pass
                 else:
                     # v1.7.3 — apply user's hours LITERALLY (both up and

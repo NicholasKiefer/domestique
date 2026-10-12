@@ -13335,7 +13335,7 @@ async function pgDrop(e, dstDay, dstWeekIdx) {
   if (!srcDay || srcDay === dstDay) return;
 
   // Find the source session's workout name for the toast (item 9)
-  let srcName = 'session', srcDayLabel = srcDay, dstDayLabel = dstDay;
+  let srcName = 'session', dstName = '', srcDayLabel = srcDay, dstDayLabel = dstDay;
   try {
     const plan = window._planData;
     if (plan && plan.weeks) {
@@ -13346,6 +13346,7 @@ async function pgDrop(e, dstDay, dstWeekIdx) {
             srcDayLabel = sess.day_name || srcDay;
           }
           if (sess.day === dstDay) {
+            dstName = sess.zwo_name || (sess.session_type || '').toUpperCase();
             dstDayLabel = sess.day_name || dstDay;
           }
         }
@@ -13368,7 +13369,7 @@ async function pgDrop(e, dstDay, dstWeekIdx) {
       try { showToast(friendly, 3500); } catch(_) {}
       return;
     }
-    try { showToast(`Moved ${srcName} from ${srcDayLabel} to ${dstDayLabel}`, 3000); } catch(_) {}
+    try { showToast(_moveToastText(data, srcName, dstName, srcDayLabel, dstDayLabel), 3000); } catch(_) {}
     await loadPlan();
     try { await loadCalendar(); } catch(_) {}
   } catch(err) {
@@ -14842,6 +14843,17 @@ function calDragEnd(e) {
   window._calDrag = null;
 }
 
+// #27: a drop on another training day swaps the two sessions; the toast says
+// where each one went. Not "Swap": that names the re-draw button and the
+// swap-type pin. {B} comes from the view's own lookup, else from the server.
+function _moveToastText(data, srcName, dstName, srcDayLabel, dstDayLabel) {
+  const sw = data && data.swapped;
+  if (sw) {
+    const other = dstName || sw.zwo_name || String(sw.session_type || '').toUpperCase() || 'session';
+    return `Moved ${srcName} to ${dstDayLabel} and ${other} to ${srcDayLabel}`;
+  }
+  return `Moved ${srcName} from ${srcDayLabel} to ${dstDayLabel}`;
+}
 async function calDrop(e, dstDay, dstWeekIdx) {
   e.preventDefault();
   e.stopPropagation();
@@ -14857,6 +14869,7 @@ async function calDrop(e, dstDay, dstWeekIdx) {
 
   // Resolve a friendly source-workout name + day labels for the toast.
   let srcName = 'session';
+  let dstName = '';
   let srcDayLabel = srcDay;
   let dstDayLabel = dstDay;
   try {
@@ -14868,6 +14881,10 @@ async function calDrop(e, dstDay, dstWeekIdx) {
             srcName = dd.planned.name
               || (dd.planned.content_class || dd.planned.session_type || '').toUpperCase()
               || 'session';
+          }
+          if (dd.date === dstDay && dd.planned) {
+            dstName = dd.planned.name
+              || (dd.planned.content_class || dd.planned.session_type || '').toUpperCase();
           }
         }
       }
@@ -14889,11 +14906,13 @@ async function calDrop(e, dstDay, dstWeekIdx) {
       if (res.status === 422 && data && data.error === 'source_session_not_found') {
         try { showToast("Couldn't find that session. Try refreshing.", 3500); } catch(_) {}
       } else {
-        try { showToast('Move failed.', 3000); } catch(_) {}
+        // #27: a refused drop (409) carries a plain sentence; show it.
+        const why = data && data.error ? `Move failed: ${data.error}` : 'Move failed.';
+        try { showToast(why, 3000); } catch(_) {}
       }
       return;
     }
-    try { showToast(`Moved ${srcName} from ${srcDayLabel} to ${dstDayLabel}`, 3000); } catch(_) {}
+    try { showToast(_moveToastText(data, srcName, dstName, srcDayLabel, dstDayLabel), 3000); } catch(_) {}
     // Re-fetch + re-render the calendar (don't yank viewport).
     window._calDidAutoScroll = true;
     await loadCalendar();
