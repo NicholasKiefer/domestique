@@ -16620,6 +16620,11 @@ function icuPushToastFromResult(r, verb) {
     showToast('HR-mode push needs a valid LTHR (below max HR) — set it in Settings first.', 7000, 'warning');
     return;
   }
+  if (r.error === 'busy') {
+    // #28: another calendar update held the lock — nothing failed.
+    showToast('A calendar update is already running — try again in a moment.', 6000, 'warning');
+    return;
+  }
   if (r.error) {
     showToast("Couldn't reach intervals.icu — nothing was changed. Try again in a moment.", 6000, 'error');
     return;
@@ -16632,7 +16637,8 @@ function icuPushToastFromResult(r, verb) {
   const nSkip = (r.skipped || []).length;
   if (nSkip) msg += ' · ' + nSkip + ' skipped';
   // #28: workouts the rider moved in intervals.icu are left there on purpose.
-  if (r.held > 0) msg += ' · ' + r.held + ' left where you moved it in intervals.icu';
+  if (r.held === 1) msg += ' · 1 workout kept where you moved it in intervals.icu';
+  else if (r.held > 1) msg += ' · ' + r.held + ' workouts kept where you moved them in intervals.icu';
   showToast(msg, 5000, 'success');
 }
 

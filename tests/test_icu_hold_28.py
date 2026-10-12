@@ -17,7 +17,9 @@ Coverage (MASTER_DECISIONS §7): B1-B10, B12-B15, C1; C2 — at most one of our
 events per workout in [today-7, today+21] unless the rider made the copy —
 is checked at the end of every #28 test, and B13 (reconcile never writes the
 plan) on every reconcile through ``_run``. B11 is the unchanged existing
-suites.
+suites. Wave 4 (MASTER §8 W1-W10): the ``test_w*`` tests, ported from the
+QA probes (qa_code P1-P3/P8, qa_scenario H1/M1), plus the restated B3, B6
+swap, B10, B12, B14 and B15 pins.
 """
 from __future__ import annotations
 
@@ -264,7 +266,8 @@ def test_b3_moved_to_today_is_not_pulled_back_next_day(env, freeze_clock):
     posted, deleted = _touched(env, mark)
     assert thu0 not in posted and thu0 not in deleted
     assert env.fk.where(thu0) == [D["mon"]]             # past day: not re-dated
-    assert r["held"] == 1 and _counts(r) == (0, 0, 0)
+    # W6: still held, but a move into the past is no longer counted.
+    assert r["held"] == 0 and _counts(r) == (0, 0, 0)
     _one_event_per_session(env)
 
 
@@ -287,20 +290,26 @@ def test_b4_move_made_in_both_places_ends_with_one_event(env, echo):
 
 # ── B5: agreed-looking, different workout (grill_data M4) ────────────────────
 
-def test_b5_swap_then_stack_in_icu_is_held_not_reverted(env):
+@pytest.mark.parametrize("echo", [True, False])
+def test_b5_swap_then_stack_in_icu_is_held_not_reverted(env, echo):
+    """echo=False is W4 (qa_code M2 / P8): without the filename the move
+    cannot be content-checked, and after a swap the slot's id is pushed
+    again — counting it as agreed re-dated the rider's event every run."""
+    env.fk.echo_filename = echo
     ss = _week(thu="steady.zwo", fri="tempo_alt.zwo")
     _seed(env, ss)
     _write_plan(_swap(ss, D["thu"], D["fri"]))
     assert _counts(_run(env)) == (0, 2, 0)              # THU:0 tempo, FRI:0 steady
     thu0 = _eid(env, D["thu"])
     env.fk.drag(thu0, D["fri"])                         # rider stacks the tempo on Fri
-    mark = len(env.fk.calls)
-    r = _run(env)
-    posted, deleted = _touched(env, mark)
-    assert thu0 not in posted and thu0 not in deleted
-    assert env.fk.where(thu0) == [D["fri"]]
-    assert env.fk.files_on() == {D["fri"]: ["steady", "tempo_alt"]}
-    assert r["held"] == 1 and _counts(r) == (0, 0, 0)
+    for _ in range(2):
+        mark = len(env.fk.calls)
+        r = _run(env)
+        posted, deleted = _touched(env, mark)
+        assert thu0 not in posted and thu0 not in deleted
+        assert env.fk.where(thu0) == [D["fri"]]
+        assert env.fk.files_on() == {D["fri"]: ["steady", "tempo_alt"]}
+        assert r["held"] == 1 and _counts(r) == (0, 0, 0)
     _one_event_per_session(env)
 
 
@@ -345,20 +354,21 @@ def test_b6_chain_of_moves_is_followed(env):
     _one_event_per_session(env)
 
 
-def test_b6_session_on_held_slot_after_swap_is_not_pushed_twice(env):
-    """#27 × #28 (grill_cal S8): the rider moved WED:0 (steady) to Fri, then
-    swapped Wed↔Thu in Domestique. The steady now lives on Thu; the rider's
-    Fri event stands in for it, so THU:0 is not pushed with steady."""
+def test_w2_swap_after_an_icu_move_follows_domestique(env):
+    """#27 × #28 (grill_cal S8, qa_scenario S4a), restated by W2: the rider
+    moved WED:0 (steady) to Fri, then swapped Wed↔Thu in Domestique. That
+    swap changed Wednesday after the rider's move, so the plan's days win:
+    the tempo reaches Wed (it was never pushed while WED:0 was held), the
+    steady is on Thu — each once."""
     ss = _week(wed="steady.zwo", thu="tempo_alt.zwo")
     _seed(env, ss)
     env.fk.drag(_eid(env, D["wed"]), D["fri"])
+    assert _run(env)["held"] == 1
     _write_plan(_swap(ss, D["wed"], D["thu"]))
     r = _run(env)
-    assert r["held"] == 1
-    # Steady only where the rider put it. The tempo now planned on Wed is not
-    # pushed while WED:0 is held (no bumped id): missing, never doubled
-    # (grill_simple M2 — learning the move is #28 step 2).
-    assert env.fk.files_on() == {D["fri"]: ["steady"]}
+    assert r["held"] == 0 and _counts(r) == (0, 2, 0)
+    assert env.fk.files_on() == {D["wed"]: ["tempo_alt"], D["thu"]: ["steady"]}
+    assert _counts(_run(env)) == (0, 0, 0)
     _one_event_per_session(env)
 
 
@@ -486,29 +496,56 @@ def test_b10_beyond_horizon_and_past_events_untouched(env):
     assert f"newest={(t + timedelta(days=21)).isoformat()}" in get   # they were read
     posted, deleted = _touched(env, mark)
     assert not (set(rows) & (posted | deleted))
-    assert r["deleted"] == 0 and r["held"] == 2
+    # Both moves are held; W6 counts only the one dated today or later.
+    assert r["deleted"] == 0 and r["held"] == 1
     for eid, d in rows.items():
         assert env.fk.where(eid) == [d.isoformat()]
     _one_event_per_session(env)
 
 
-# ── B12: sweep_all keeps its window and still removes everything ours ────────
+# ── B12 / W7: sweep_all removes everything ours from today on ────────────────
 
-def test_b12_sweep_all_unchanged(env):
+def test_w7_sweep_all_removes_everything_ours_from_today_on(env):
+    """W7 (qa_scenario L2), restating B12: toggle-off / disconnect also
+    removes a rider move 15-21 days out (the hold keeps it out there) and a
+    planner push past the horizon. Past days stay."""
     _seed(env, _week(wed="steady.zwo", fri="tempo_alt.zwo"))
     env.fk.drag(_eid(env, D["wed"]), D["thu"])          # a held move goes too
     t = clock.today()
-    beyond = _eid(env, (t + timedelta(days=16)).isoformat())
-    env.fk.events.append({"id": 77, "external_id": beyond, "category": "WORKOUT",
-                          "start_date_local": f"{(t + timedelta(days=16)).isoformat()}T00:00:00",
-                          "name": "beyond", "filename": "beyond.zwo"})
+    far, past = t + timedelta(days=18), t - timedelta(days=2)
+    past_id = _eid(env, past.isoformat())
+    env.fk.events += [
+        {"id": 77, "external_id": _eid(env, (t + timedelta(days=10)).isoformat()),
+         "category": "WORKOUT", "start_date_local": f"{far.isoformat()}T00:00:00",
+         "name": "moved out", "filename": "far.zwo"},
+        {"id": 78, "external_id": _eid(env, (t + timedelta(days=16)).isoformat()),
+         "category": "WORKOUT",
+         "start_date_local": f"{(t + timedelta(days=16)).isoformat()}T00:00:00",
+         "name": "planner push", "filename": "beyond.zwo"},
+        {"id": 79, "external_id": past_id, "category": "WORKOUT",
+         "start_date_local": f"{past.isoformat()}T00:00:00", "name": "ridden",
+         "filename": "past.zwo"},
+    ]
     mark = len(env.fk.calls)
     r = icp.sweep_all()
     get = next(c for c in env.fk.calls[mark:] if c[0] == "GET")[1]
     assert get.endswith(f"events?oldest={t.isoformat()}"
-                        f"&newest={(t + timedelta(days=14)).isoformat()}")
-    assert r["deleted"] == 2 and env.fk.ids() == [beyond]
+                        f"&newest={(t + timedelta(days=21)).isoformat()}")
+    assert r["deleted"] == 4 and env.fk.ids() == [past_id]
     assert "held" not in r
+
+
+def test_w7_sweep_all_waits_out_a_slow_reconcile(env, monkeypatch):
+    """W7: disconnect purges the token right after its sweep — the sweep
+    waits longer for the lock than a reconcile does instead of skipping."""
+    assert icp._SWEEP_LOCK_TIMEOUT_S >= 120
+    _seed(env, _week(wed="steady.zwo"))
+    monkeypatch.setattr(icp, "_RECONCILE_LOCK_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(icp, "_SWEEP_LOCK_TIMEOUT_S", 5.0)
+    assert icp._RECONCILE_LOCK.acquire(timeout=1)
+    threading.Timer(0.3, icp._RECONCILE_LOCK.release).start()
+    r = icp.sweep_all()
+    assert not r.get("error") and r["deleted"] == 1 and env.fk.ids() == []
 
 
 # ── B13: never writes the plan, never raises ─────────────────────────────────
@@ -558,11 +595,15 @@ icuPushToastFromResult({pushed: 0, updated: 0, deleted: 0, skipped: [], held: 2}
 icuPushToastFromResult({pushed: 1, updated: 0, deleted: 0, skipped: [{}], held: 1}, v);
 icuPushToastFromResult({pushed: 0, updated: 0, deleted: 0, skipped: [], held: 0}, v);
 icuPushToastFromResult({pushed: 0, updated: 0, deleted: 2, skipped: []}, 'Calendar sync off — cleanup');
+icuPushToastFromResult({pushed: 0, updated: 0, deleted: 0, skipped: [], held: 0, error: 'busy'}, v);
+icuPushToastFromResult({pushed: 0, updated: 0, deleted: 0, skipped: [], held: 0, error: 'network'}, v);
 const want = [
-  'Pushed to intervals.icu: calendar already up to date · 2 left where you moved it in intervals.icu',
-  'Pushed to intervals.icu: 1 new · 1 skipped · 1 left where you moved it in intervals.icu',
+  'Pushed to intervals.icu: calendar already up to date · 2 workouts kept where you moved them in intervals.icu',
+  'Pushed to intervals.icu: 1 new · 1 skipped · 1 workout kept where you moved it in intervals.icu',
   'Pushed to intervals.icu: calendar already up to date',
   'Calendar sync off — cleanup: 2 removed',
+  'A calendar update is already running — try again in a moment.',
+  "Couldn't reach intervals.icu — nothing was changed. Try again in a moment.",
 ];
 if (JSON.stringify(seen) !== JSON.stringify(want)) throw new Error(JSON.stringify(seen));
 console.log('OK');
@@ -603,6 +644,7 @@ def test_b15_second_reconcile_waits_for_the_first(env, monkeypatch):
 def test_b15_busy_after_the_timeout(env, monkeypatch):
     _write_plan(_week(wed="steady.zwo"))
     monkeypatch.setattr(icp, "_RECONCILE_LOCK_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(icp, "_SWEEP_LOCK_TIMEOUT_S", 0.05)
     assert icp._RECONCILE_LOCK.acquire(timeout=1)
     try:
         assert icp.reconcile()["error"] == "busy"
@@ -626,7 +668,9 @@ def test_c1_swap_with_fileless_partner_leaves_one_copy(env):
     _one_event_per_session(env)
 
 
-def test_c1_swap_with_missing_file_partner_puts_nothing_on_the_wrong_day(env):
+@pytest.mark.parametrize("echo", [True, False])
+def test_c1_swap_with_missing_file_partner_puts_nothing_on_the_wrong_day(env, echo):
+    env.fk.echo_filename = echo
     ss = _week(wed="steady.zwo", thu="tempo_alt.zwo")
     _seed(env, ss)
     _write_plan(_swap(ss, D["wed"], D["thu"]))
@@ -660,9 +704,13 @@ def test_c1_library_outage_on_unmoved_session_keeps_its_event(env, echo):
     assert r["deleted"] == 0 and env.fk.files_on() == {D["wed"]: ["steady"]}
 
 
-def test_c1_moved_session_keeps_its_own_event_through_a_build_failure(env):
+@pytest.mark.parametrize("echo", [True, False])
+def test_c1_moved_session_keeps_its_own_event_through_a_build_failure(env, echo):
     """Same workout at the id (steady.fit vs steady.zwo compare by stem):
-    a session pushed after its move keeps its event when lthr breaks."""
+    a session pushed after its move keeps its event when lthr breaks.
+    echo=False is W5 (qa_code M3 / P3): without the filename, a session that
+    arrived by a move (a stub on the day it left) still owns its event."""
+    env.fk.echo_filename = echo
     env.pm._athlete.update({"target_mode": "hr", "lthr": 160, "max_hr": 185})
     _seed(env, _move(_week(wed="steady.zwo"), D["wed"], D["fri"]))
     assert env.fk.files_on() == {D["fri"]: ["steady"]}
@@ -670,6 +718,281 @@ def test_c1_moved_session_keeps_its_own_event_through_a_build_failure(env):
     r = _run(env)
     assert r.get("needs_lthr") is True
     assert r["deleted"] == 0 and env.fk.files_on() == {D["fri"]: ["steady"]}
+
+
+# ── W1: an agreed move's event goes only once its new id is pushed ───────────
+
+def test_w1_agreed_event_kept_while_its_new_id_is_held(env, freeze_clock):
+    """qa_code H1 / P1, and W9 (a move into the past is never agreed): the
+    rider swapped yesterday's missed A (Tue) and Thursday's B in both places.
+    TUE:0 (A, now on Thu) is agreed, but A's new id THU:0 is held (its event
+    went into the past), so nothing replaces TUE:0 — it must stay."""
+    ss = _week(tue="sweet.zwo", thu="steady.zwo")
+    _seed(env, ss)                                      # TUE:0 sweet, THU:0 steady
+    freeze_clock(date.fromisoformat(D["wed"]))          # Tue is yesterday
+    tue0, thu0 = _eid(env, D["tue"]), _eid(env, D["thu"])
+    env.fk.drag(tue0, D["thu"])                         # intervals.icu: A to Thu,
+    env.fk.drag(thu0, D["tue"])                         # B to Tue (past)
+    ss[_at(ss, D["tue"])]["status"] = "missed"
+    _write_plan(_swap(ss, D["tue"], D["thu"]))          # Domestique: the same swap
+    mark = len(env.fk.calls)
+    r = _run(env)
+    posted, deleted = _touched(env, mark)
+    assert tue0 not in deleted and thu0 not in posted   # past event never re-dated
+    assert env.fk.files_on() == {D["tue"]: ["steady"], D["thu"]: ["sweet"]}
+    assert _counts(r) == (0, 0, 0) and r["held"] == 0   # W6: the held one is past
+    _one_event_per_session(env)
+
+
+@pytest.mark.parametrize("echo", [True, False])
+def test_w1_agreed_event_kept_while_its_new_id_cannot_be_built(env, echo):
+    """qa_code H1, unbuildable variant: the move is agreed but the library
+    is out; the rider's event is the only copy until FRI:0 can be pushed."""
+    env.fk.echo_filename = echo
+    ss = _week(mon="sweet.zwo", wed="steady.zwo")
+    _seed(env, ss)
+    wed0, fri0 = _eid(env, D["wed"]), _eid(env, D["fri"])
+    env.fk.drag(wed0, D["fri"])
+    _write_plan(_move(ss, D["wed"], D["fri"]))
+    (env.workouts / "steady.zwo").rename(env.workouts / "steady.bak")
+    r = _run(env)
+    assert {"day": D["fri"], "reason": "file_missing"} in r["skipped"]
+    assert r["deleted"] == 0 and env.fk.where(wed0) == [D["fri"]]
+    (env.workouts / "steady.bak").rename(env.workouts / "steady.zwo")
+    r = _run(env)                                       # back: replaced, then swept
+    assert _counts(r) == (1, 0, 1) and env.fk.where(fri0) == [D["fri"]]
+    assert env.fk.files_on() == {D["mon"]: ["sweet"], D["fri"]: ["steady"]}
+    _one_event_per_session(env)
+
+
+# ── W2: Domestique changed the slot after the rider's move → the plan wins ───
+
+@pytest.mark.parametrize("echo", [True, False])
+def test_w2_a_different_workout_on_a_held_slot_is_pushed(env, echo):
+    """qa_code M4 / P4, qa_scenario H1 (regenerate, refit): the plan puts a
+    different workout on the day whose event the rider moved. It reaches the
+    watch; the old workout, no longer planned, leaves it. Without an echoed
+    filename the event's name tells the workouts apart."""
+    env.fk.echo_filename = echo
+    ss = _week(mon="sweet.zwo", wed="steady.zwo")
+    _seed(env, ss)
+    wed0 = _eid(env, D["wed"])
+    env.fk.drag(wed0, D["fri"])
+    assert _run(env)["held"] == 1
+    ss[_at(ss, D["wed"])] = _sess(D["wed"], zwo="tempo_alt.zwo", stype="tempo")
+    _write_plan(ss)
+    r = _run(env)
+    assert r["held"] == 0 and env.fk.where(wed0) == [D["wed"]]
+    assert env.fk.files_on() == {D["mon"]: ["sweet"], D["wed"]: ["tempo_alt"]}
+    assert _counts(_run(env)) == (0, 0, 0)
+    _one_event_per_session(env)
+
+
+def test_w2_auto_takeover_of_a_held_slot_reaches_the_watch(env):
+    """qa_scenario H1 (easy-day takeover): the rider moved Fri's ride to Sun
+    in intervals.icu; the adapt then puts Wed's key session on Fri over it.
+    The key session is on Fri; the written-off ride is gone."""
+    ss = _week(wed="sweet.zwo", fri="steady.zwo")
+    _seed(env, ss)
+    env.fk.drag(_eid(env, D["fri"]), D["sun"])
+    assert _run(env)["held"] == 1
+    _write_plan(_move(ss, D["wed"], D["fri"], auto=True))
+    r = _run(env)
+    assert r["held"] == 0
+    assert env.fk.files_on() == {D["fri"]: ["sweet"]}
+    _one_event_per_session(env)
+
+
+def test_w2_dismissing_a_session_the_rider_moved_takes_it_off_the_watch(env):
+    """qa_scenario M1: dismiss removes the event, as it does for an unmoved one."""
+    ss = _week(mon="sweet.zwo", wed="steady.zwo")
+    _seed(env, ss)
+    env.fk.drag(_eid(env, D["wed"]), D["thu"])
+    assert _run(env)["held"] == 1
+    ss[_at(ss, D["wed"])].update(status="dismissed", dismissed_at="2026-10-19T08:00:00")
+    _write_plan(ss)
+    r = _run(env)
+    assert r["held"] == 0 and r["deleted"] == 1
+    assert env.fk.files_on() == {D["mon"]: ["sweet"]}
+
+
+def test_w2_drag_onto_the_held_slot_after_moving_its_session(env):
+    """qa_scenario: the rider moved WED:0 to Thu in intervals.icu, then in
+    Domestique dragged Wed's ride to Sat and Fri's tempo onto Wed."""
+    ss = _week(wed="steady.zwo", fri="tempo_alt.zwo")
+    _seed(env, ss)
+    env.fk.drag(_eid(env, D["wed"]), D["thu"])
+    _move(ss, D["wed"], D["sat"])
+    _write_plan(_move(ss, D["fri"], D["wed"]))
+    r = _run(env)
+    assert r["held"] == 0
+    assert env.fk.files_on() == {D["wed"]: ["tempo_alt"], D["sat"]: ["steady"]}
+    _one_event_per_session(env)
+
+
+@pytest.mark.parametrize("echo", [True, False])
+def test_w2_stub_whose_chain_leads_to_a_different_workout_releases(env, echo):
+    """The same session dragged on in Domestique keeps the rider's copy (the
+    accepted residual until #33). Once the day it went to holds a different
+    workout, the rider's event is a workout the plan no longer has."""
+    env.fk.echo_filename = echo
+    ss = _week(mon="sweet.zwo", wed="steady.zwo")
+    _seed(env, ss)
+    env.fk.drag(_eid(env, D["wed"]), D["thu"])
+    _write_plan(_move(ss, D["wed"], D["sat"]))
+    r = _run(env)
+    assert r["held"] == 1                               # residual: ICU copy kept
+    assert env.fk.files_on() == {D["mon"]: ["sweet"], D["thu"]: ["steady"]}
+    ss[_at(ss, D["sat"])].update(zwo_file="tempo_alt.zwo", zwo_name="tempo_alt")
+    _write_plan(ss)
+    r = _run(env)
+    assert r["held"] == 0
+    assert env.fk.files_on() == {D["mon"]: ["sweet"], D["sat"]: ["tempo_alt"]}
+    _one_event_per_session(env)
+
+
+def test_w2_a_move_into_the_past_is_never_released(env, freeze_clock):
+    """Past-day rule: a rider-moved event dated before today stays put even
+    when the plan has since changed its slot."""
+    ss = _week(thu="steady.zwo")
+    _seed(env, ss)
+    thu0 = _eid(env, D["thu"])
+    env.fk.drag(thu0, D["mon"])                         # ridden early, today
+    freeze_clock(date.fromisoformat(D["tue"]))
+    ss[_at(ss, D["thu"])].update(zwo_file="tempo_alt.zwo", zwo_name="tempo_alt")
+    _write_plan(ss)
+    mark = len(env.fk.calls)
+    r = _run(env)
+    posted, deleted = _touched(env, mark)
+    assert thu0 not in posted and thu0 not in deleted
+    assert env.fk.where(thu0) == [D["mon"]] and r["held"] == 0
+    _one_event_per_session(env)
+
+
+def test_w2_a_session_the_plan_dropped_leaves_the_watch(env):
+    """The day's second session (WED:1) was moved by the rider, then the plan
+    dropped it: the slot is gone, so is the event."""
+    ss = _week(mon="sweet.zwo", wed="steady.zwo")
+    _seed(env, ss + [_sess(D["wed"], zwo="tempo_alt.zwo", stype="tempo")])
+    wed1 = _eid(env, D["wed"], 1)
+    env.fk.drag(wed1, D["fri"])
+    assert _run(env)["held"] == 1
+    _write_plan(ss)
+    r = _run(env)
+    assert r["held"] == 0 and r["deleted"] == 1
+    assert env.fk.files_on() == {D["mon"]: ["sweet"], D["wed"]: ["steady"]}
+
+
+def test_w2_moves_in_both_places_end_on_the_plans_days(env):
+    """qa_code P1b: in intervals.icu the rider moved P Thu→Sat and S Wed→Thu;
+    in Domestique they dropped S on Thu (a swap: P to Wed). Domestique
+    changed Thursday after the rider's move, so the plan's week wins —
+    nothing lost, nothing doubled."""
+    ss = _week(wed="sweet.zwo", thu="steady.zwo")
+    _seed(env, ss)
+    env.fk.drag(_eid(env, D["thu"]), D["sat"])
+    env.fk.drag(_eid(env, D["wed"]), D["thu"])
+    _write_plan(_swap(ss, D["wed"], D["thu"]))
+    r = _run(env)
+    assert r["held"] == 0
+    assert env.fk.files_on() == {D["wed"]: ["steady"], D["thu"]: ["sweet"]}
+    assert _counts(_run(env)) == (0, 0, 0)
+    _one_event_per_session(env)
+
+
+# ── W3: the moved_from chain checks the workout ──────────────────────────────
+
+def test_w3_chain_through_a_swap_finds_the_rider_moved_workout(env):
+    """qa_code M1 / P2: the rider moved MON:0 (sweet) to Sun in intervals.icu;
+    in Domestique: Mon→Tue, Tue↔Thu swap, Tue→Sat. The stub chain from Mon
+    ends on the partner (steady, Sat); the sweet is on Thu. The rider's Sun
+    event stands in for the sweet, and the steady is pushed on Sat."""
+    ss = _week(mon="sweet.zwo", thu="steady.zwo")
+    _seed(env, ss)
+    env.fk.drag(_eid(env, D["mon"]), D["sun"])
+    _move(ss, D["mon"], D["tue"])
+    _swap(ss, D["tue"], D["thu"])
+    _write_plan(_move(ss, D["tue"], D["sat"]))
+    r = _run(env)
+    assert r["held"] == 1
+    assert env.fk.files_on() == {D["sat"]: ["steady"], D["sun"]: ["sweet"]}
+    _one_event_per_session(env)
+
+
+# ── W4: no echoed filename → agree only with an unambiguous plain move ──────
+
+def test_w4_no_filename_agreement_needs_a_single_session_from_that_day(env):
+    """Two sessions in the week left Wednesday (a swap, then a move). Without
+    the filename the plan's move cannot be told from the swap, so the
+    rider's event is held — not deleted and re-created under a new id."""
+    ss = _week(wed="steady.zwo", thu="tempo_alt.zwo")
+    _seed(env, ss)
+    _write_plan(_swap(ss, D["wed"], D["thu"]))
+    assert _counts(_run(env)) == (0, 2, 0)              # WED:0 tempo, THU:0 steady
+    env.fk.echo_filename = False
+    wed0 = _eid(env, D["wed"])
+    env.fk.drag(wed0, D["fri"])
+    _write_plan(_move(ss, D["wed"], D["fri"]))          # the tempo goes Wed → Fri
+    mark = len(env.fk.calls)
+    r = _run(env)
+    posted, deleted = _touched(env, mark)
+    assert wed0 not in deleted and _eid(env, D["fri"]) not in posted
+    assert env.fk.where(wed0) == [D["fri"]] and r["held"] == 1
+    assert env.fk.files_on() == {D["thu"]: ["steady"], D["fri"]: ["tempo_alt"]}
+    _one_event_per_session(env)
+
+
+# ── W6: held is on every reconcile result ───────────────────────────────────
+
+def test_w6_held_is_on_every_result(env, monkeypatch):
+    assert icp.reconcile()["held"] == 0                 # no plan yet
+    _write_plan(_week(wed="steady.zwo"))
+    env.fk.fail["GET"] = (500, b"down")
+    r = icp.reconcile()
+    assert r["error"] == "http_500" and r["held"] == 0
+    env.fk.fail.clear()
+    monkeypatch.setattr(icp, "_RECONCILE_LOCK_TIMEOUT_S", 0.05)
+    assert icp._RECONCILE_LOCK.acquire(timeout=1)
+    try:
+        r = icp.reconcile()
+    finally:
+        icp._RECONCILE_LOCK.release()
+    assert r["error"] == "busy" and r["held"] == 0
+
+    def boom(*_a, **_k):
+        raise RuntimeError("hold logic exploded")
+    monkeypatch.setattr(icp, "_held_ids", boom)
+    r = icp.reconcile()
+    assert r["error"] == "internal:RuntimeError" and r["held"] == 0
+
+
+# ── W9: the guards no test pinned ────────────────────────────────────────────
+
+def test_w9_a_copy_is_never_agreed(env):
+    """qa_code L1 [8]: the rider copied WED:0 to Fri and the plan made the
+    move too. Agreeing would sweep by external_id — both copies."""
+    ss = _week(wed="steady.zwo")
+    _seed(env, ss)
+    wed0 = _eid(env, D["wed"])
+    env.fk.copy(wed0, D["fri"])
+    _write_plan(_move(ss, D["wed"], D["fri"]))
+    mark = len(env.fk.calls)
+    r = _run(env)
+    posted, deleted = _touched(env, mark)
+    assert wed0 not in posted and wed0 not in deleted
+    assert _eid(env, D["fri"]) not in posted            # the rider's copy stands in
+    assert env.fk.where(wed0) == [D["wed"], D["fri"]] and r["held"] == 1
+    _one_event_per_session(env)
+
+
+def test_w9_swap_search_needs_the_events_file():
+    """qa_code L1 [19]: without an echoed filename the swap search cannot
+    tell the sessions apart — not even a fileless one that left the day."""
+    ss = _swap(_week(wed="", thu="steady.zwo"), D["wed"], D["thu"])
+    by_day = icp._sessions_by_day({"weeks": [{"sessions": ss}]})
+    ev = {"external_id": f"domestique:p:{D['wed']}:0", "name": "threshold session",
+          "start_date_local": f"{D['fri']}T00:00:00"}
+    assert icp._resolve_moved_session(by_day, D["wed"], 0, ev, lambda: {}) == (None, False)
 
 
 if __name__ == "__main__":

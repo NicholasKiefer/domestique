@@ -31,16 +31,28 @@ Contract highlights (GRILL OUTCOME — LOCKED, /tmp/IP_ICU_PUSH.md):
     plan): our event dated on another day than the one in its external_id
     was moved by the rider. Unless the plan agrees with the move (a session
     on that date moved from the encoded day, same workout), the id is HELD:
-      * no visible re-date of a rider-moved event (never in the upsert);
+      * no visible re-date of a rider-moved event by reconcile (never in
+        the upsert);
       * a rider-moved event is never deleted by reconcile unless the plan
-        agrees with the move;
+        agrees with the move — and then only once the session's own new
+        event is in the same run's upsert;
       * one event per session: the session a held event stands for is not
         pushed anywhere else (found through its moved_from chain); no bumped
         id is ever minted.
+    The hold is released when Domestique has since changed that slot — the
+    day now holds a different workout, was dismissed, lost the session, or
+    its moved_from chain leads to a different workout: the plan's day wins
+    and the id is pushed / swept as usual. Never for an event dated before
+    today (past days are never re-dated or deleted).
+    The planner's single "Send to intervals.icu calendar" push (the
+    push-workout endpoint) does NOT apply the hold: it is an explicit rider
+    action and writes the slot's id wherever its event was.
   - broken_ids (#27): an unbuildable session spares its slot's event only
     while that event still carries this session's workout — after a swap
     the slot's old event is the other session's.
-  - One reconcile / sweep_all at a time (module lock; 60 s, then "busy").
+  - One reconcile / sweep_all at a time (module lock; reconcile waits 60 s,
+    sweep_all 120 s, then "busy"). sweep_all deletes our events dated
+    [today, today+horizon+7] — rider-moved ones included.
   - Toast counts derive from the local diff vs the pre-upsert GET, not from
     ICU response fields (G-G).
   - apikey auth = always write-capable (G-F); OAuth needs the CALENDAR:WRITE
@@ -501,25 +513,83 @@ def _event_day(ev: dict) -> date | None:
         return None
 
 
-def _plan_agrees(by_day: dict, enc: str, ev_day: str, ev: dict) -> bool:
+def _same_workout(s: dict, ev: dict, names):
+    """Is the session the workout the event carries? True / False, or None
+    when it cannot be told: a session without a workout file, or an event
+    with neither filename nor name. Files compare by stem; when intervals.icu
+    does not echo the filename, the event's name is compared with the name
+    we would push (``names`` lazily returns the classifications)."""
+    have = _stem(s.get("zwo_file"))
+    if not have:
+        return None
+    there = _stem(ev.get("filename"))
+    if there:
+        return there == have
+    name = str(ev.get("name") or "")
+    return name == _display_name(s, names()) if name else None
+
+
+def _week_rows(by_day: dict, day_iso: str):
+    """(day, index, session) for every live (non-stub) row in day_iso's ISO week."""
+    week = _iso_week(day_iso)
+    return [(d, k, x) for d, ss in by_day.items() if _iso_week(d) == week
+            for k, x in enumerate(ss) if not _is_stub(x)]
+
+
+def _plan_agrees(by_day: dict, enc: str, n: int, ev_day: str, ev: dict):
     """grill_simple C1 + grill_data M4: the plan made the same move when a
     session on the event's day was moved from the encoded day — and, when
     both sides name a file, it is the same workout (a #27 swap followed by
-    an intervals.icu stack must not look agreed)."""
+    an intervals.icu stack must not look agreed). Returns that session's
+    index on the event's day (its new id, W1), or None."""
     want = _stem(ev.get("filename"))
-    for s in by_day.get(ev_day) or []:
+    if not want:
+        # W4 (qa_code M2): without an echoed filename the content cannot be
+        # checked. Agree only with a plain move — the encoded slot is a stub
+        # and exactly one session in the week left that day. After a swap the
+        # slot's id is pushed again, so "agreeing" re-dated the rider's event.
+        slot = by_day.get(enc) or []
+        if not (n < len(slot) and _is_stub(slot[n])):
+            return None
+        if sum(1 for _d, _k, x in _week_rows(by_day, enc)
+               if x.get("moved_from") == enc) != 1:
+            return None
+    for k, s in enumerate(by_day.get(ev_day) or []):
         if s.get("moved_from") != enc:
             continue
         have = _stem(s.get("zwo_file"))
         if not want or not have or want == have:
-            return True
-    return False
+            return k
+    return None
+
+
+def _slot_changed(by_day: dict, enc: str, n: int, ev: dict, names) -> bool:
+    """W2 (qa_scenario H1/M1): has Domestique changed the slot since the rider
+    moved its event? The day now holds a different workout, a dismissed
+    session, no session at that index, or a stub whose chain leads to a
+    different workout. Then the plan's day wins and the hold is released.
+    Not comparable (no file, no name) or a day outside the plan → hold."""
+    slot = by_day.get(enc)
+    if slot is None:
+        return False
+    if n >= len(slot):
+        return True
+    s = slot[n]
+    if str(s.get("status") or "") == "dismissed":
+        return True
+    if _is_stub(s):
+        return _resolve_moved_session(by_day, enc, n, ev, names)[1]
+    return _same_workout(s, ev, names) is False
 
 
 def _held_ids(events: list, by_day: dict, profile_id: str,
-              today: date) -> dict:
-    """external_id → (encoded day, n, the moved copy) for every id of ours the
-    rider moved in intervals.icu and the plan has not followed.
+              today: date, names) -> tuple[dict, dict]:
+    """(held, agreed) for every id of ours the rider moved in intervals.icu.
+
+    held:   external_id → (encoded day, n, the moved copy) — moves the plan
+            has not followed and has not overridden since (W2).
+    agreed: external_id → the id the plan now pushes that session under; the
+            moved event may go only once that id is in the upsert (W1).
 
     Read from the RAW GET list (an intervals.icu copy can share our id; the
     ``ours`` dict keeps one copy per id). Only ids that strictly match our
@@ -527,7 +597,8 @@ def _held_ids(events: list, by_day: dict, profile_id: str,
     ``domestique-manual:``, never another profile. An unparseable event date
     is not a move (legacy fail-closed behaviour). Every writer of these ids
     writes date == encoded day, so a different date is the rider's move."""
-    pattern = re.compile(re.escape(f"{_ID_ROOT}{profile_id}:")
+    prefix = f"{_ID_ROOT}{profile_id}:"
+    pattern = re.compile(re.escape(prefix)
                          + r"([0-9]{4}-[0-9]{2}-[0-9]{2}):([0-9]+)")
     groups: dict[str, tuple] = {}
     for ev in events:
@@ -538,48 +609,33 @@ def _held_ids(events: list, by_day: dict, profile_id: str,
         if m is None or _iso_week(m.group(1)) is None:
             continue
         groups.setdefault(eid, (m.group(1), int(m.group(2)), []))[2].append(ev)
-    held = {}
+    held, agreed = {}, {}
     for eid, (enc, n, evs) in groups.items():
         moved = [(ev, d) for ev, d in ((ev, _event_day(ev)) for ev in evs)
                  if d is not None and d.isoformat() != enc]
         if not moved:
             continue
         ev, d = moved[0]
-        # A copy (two events, one id) is never agreed: either upsert or
-        # delete could hit the rider's copy. A move into the past is never
-        # agreed either: following it would re-date a past (possibly
-        # ride-paired) event on a swap — past days are never re-dated.
-        if len(evs) == 1 and d >= today and _plan_agrees(
-                by_day, enc, d.isoformat(), ev):
-            continue
+        # A copy (two events, one id) is never agreed nor released: either
+        # upsert or delete could hit the rider's copy. A move into the past
+        # is never agreed nor released either: following it would re-date a
+        # past (possibly ride-paired) event — past days are never re-dated.
+        if len(evs) == 1 and d >= today:
+            k = _plan_agrees(by_day, enc, n, d.isoformat(), ev)
+            if k is not None:
+                agreed[eid] = f"{prefix}{d.isoformat()}:{k}"
+                continue
+            if _slot_changed(by_day, enc, n, ev, names):
+                continue
         held[eid] = (enc, n, ev)
-    return held
+    return held, agreed
 
 
-def _resolve_moved_session(by_day: dict, enc: str, n: int, ev: dict):
-    """(day, index) where the plan now holds the session a held event was
-    pushed for, or None (grill_cal C-1, prototype R1).
-
-    A stub ``moved_from:X`` on the encoded day leads to X's row that came
-    from there (or X's own stub when it moved on again), hop by hop, never
-    revisiting a day. No stub means a #27 swap or a later move refilled the
-    slot: the session is the one in that ISO week that left the encoded day
-    with the event's workout — without an echoed filename it cannot be told
-    apart, so nothing is resolved."""
-    slot = by_day.get(enc) or []
-    s = slot[n] if n < len(slot) else None
-    if s is None:
-        return None
-    if not _is_stub(s):
-        want = _stem(ev.get("filename"))
-        if not want:
-            return None
-        week = _iso_week(enc)
-        hits = [(d, k) for d, ss in by_day.items() if _iso_week(d) == week
-                for k, x in enumerate(ss)
-                if not _is_stub(x) and x.get("moved_from") == enc
-                and _stem(x.get("zwo_file")) == want]
-        return hits[0] if len(hits) == 1 else None
+def _chain_end(by_day: dict, enc: str, s: dict):
+    """Follow the ``moved_from:X`` stubs from the encoded day to X's row that
+    came from there (or X's own stub when it moved on again), never
+    revisiting a day: (day, index, session) of the live row it ends on, or
+    None when it breaks (a cycle, a fork, a swap midway, too many hops)."""
     prev, seen = enc, {enc}
     for _ in range(_MAX_CHAIN_HOPS):
         nxt = str(s.get("status"))[len("moved_from:"):]
@@ -592,22 +648,65 @@ def _resolve_moved_session(by_day: dict, enc: str, n: int, ev: dict):
             return None
         k, s = hits[0]
         if not _is_stub(s):
-            return nxt, k
+            return nxt, k, s
         prev = nxt
     return None
 
 
-def _still_this_workout(s: dict, ev: dict) -> bool:
+def _resolve_moved_session(by_day: dict, enc: str, n: int, ev: dict, names):
+    """((day, index) | None, elsewhere) — where the plan now holds the session
+    a held event was pushed for (grill_cal C-1, prototype R1), and whether the
+    slot's stub chain positively leads to a different workout (W2).
+
+    A stub on the encoded day is followed (``_chain_end``). W3 (qa_code M1):
+    the chain's end must be the event's workout — a swap midway hands the
+    chain to the partner — else the one live session in that ISO week that
+    moved and carries the event's file is taken. No stub means a #27 swap
+    or a later move refilled the slot: the session is the one in that ISO
+    week that left the encoded day with the event's workout — without an
+    echoed filename it cannot be told apart, so nothing is resolved."""
+    slot = by_day.get(enc) or []
+    s = slot[n] if n < len(slot) else None
+    if s is None:
+        return None, False
+    want = _stem(ev.get("filename"))
+    if not _is_stub(s):
+        if not want:
+            return None, False
+        hits = [(d, k) for d, k, x in _week_rows(by_day, enc)
+                if x.get("moved_from") == enc and _stem(x.get("zwo_file")) == want]
+        return (hits[0] if len(hits) == 1 else None), False
+    end = _chain_end(by_day, enc, s)
+    if end is not None:
+        day, k, x = end
+        if str(x.get("status") or "") == "dismissed":
+            return None, True
+        if _same_workout(x, ev, names) is not False:
+            return (day, k), False
+    hits = [(d, k) for d, k, x in _week_rows(by_day, enc)
+            if want and x.get("moved_from") and _stem(x.get("zwo_file")) == want]
+    if len(hits) == 1:
+        return hits[0], False
+    return None, end is not None and not hits
+
+
+def _still_this_workout(s: dict, ev: dict, by_day: dict) -> bool:
     """#27 (MASTER §4.1): may the sweep spare the event at an unbuildable
     session's id? Only while that event is this session's workout. After a
     swap the slot's prior event carries the OTHER session — sparing it put
     one workout on two days (or the wrong day) on the watch. Unknown on
-    either side → the old rule for a session that never moved (a library
-    outage on an unmoved session still keeps its event)."""
+    either side → spare a session that never moved (a library outage on an
+    unmoved session still keeps its event), and (W5, qa_code M3) one that
+    arrived by a move: the day it left holds a stub pointing here, so the
+    event at its id was pushed for it. A swap leaves no stub."""
     have, there = _stem(s.get("zwo_file")), _stem(ev.get("filename"))
     if have and there:
         return have == there
-    return not s.get("moved_from")
+    left = s.get("moved_from")
+    if not left:
+        return True
+    return any(str(x.get("status") or "") == f"moved_from:{s.get('day')}"
+               for x in by_day.get(left) or [])
 
 
 # #28 (grill_cal M-3): the sync thread, the 30 s debounce timer and the Push
@@ -615,33 +714,41 @@ def _still_this_workout(s: dict, ev: dict) -> bool:
 # external_id could leave two events under one id. One run at a time.
 _RECONCILE_LOCK = threading.Lock()
 _RECONCILE_LOCK_TIMEOUT_S = 60.0
+# W7: toggle-off and disconnect must not skip their final sweep behind one
+# slow reconcile (three 30 s HTTP calls) — the token is purged right after.
+_SWEEP_LOCK_TIMEOUT_S = 120.0
 
 
-def _one_at_a_time(fn):
-    @functools.wraps(fn)
-    def run(*args, **kwargs):
-        if not _RECONCILE_LOCK.acquire(timeout=_RECONCILE_LOCK_TIMEOUT_S):
-            _log.warning("EVENT=icu_calendar_busy fn=%s", fn.__name__)
-            return _result(error="busy")
-        try:
-            return fn(*args, **kwargs)
-        finally:
-            _RECONCILE_LOCK.release()
-    return run
+def _one_at_a_time(timeout_s: float, fn, *args):
+    """Run fn under the module lock; "busy" when it stays taken for timeout_s
+    (read at call time, so tests can shorten it)."""
+    if not _RECONCILE_LOCK.acquire(timeout=timeout_s):
+        _log.warning("EVENT=icu_calendar_busy fn=%s", fn.__name__)
+        return _result(error="busy")
+    try:
+        return fn(*args)
+    finally:
+        _RECONCILE_LOCK.release()
 
 
-@_one_at_a_time
 def reconcile(horizon_days: int = HORIZON_DAYS) -> dict:
     """Mirror [today, today+horizon] of the stored plan onto the ICU calendar.
 
     Returns {pushed, updated, deleted, skipped:[{day,reason}], held} plus at
     most one of needs_reconnect / needs_lthr / error ("busy" when another
-    run held the lock for a minute). ``held`` counts our events left where
-    the rider moved them in intervals.icu (#28). Never raises; never writes
-    the plan.
+    run held the lock for a minute). ``held`` counts our events dated today
+    or later left where the rider moved them in intervals.icu (#28); it is 0
+    on every early return (W6). Never raises; never writes the plan.
     """
+    out = _one_at_a_time(_RECONCILE_LOCK_TIMEOUT_S, _reconcile, horizon_days)
+    out.setdefault("held", 0)
+    return out
+
+
+def _reconcile(horizon_days: int) -> dict:
     from profile_manager import ProfileManager
     try:
+        import app as _app
         pm = ProfileManager.get()
         profile_id = pm.active_id
         if not profile_id:
@@ -677,12 +784,16 @@ def reconcile(horizon_days: int = HORIZON_DAYS) -> dict:
         # stands for is not pushed anywhere else either, so a later
         # auto-reschedule or swap cannot put the workout on two days.
         by_day = _sessions_by_day(plan)
-        held = _held_ids(existing, by_day, profile_id, today)
-        result["held"] = len(held)
+        names = functools.lru_cache(maxsize=None)(
+            lambda: _load_classifications(Path(_app.WORKOUT_DIR)))
+        held, agreed = _held_ids(existing, by_day, profile_id, today, names)
+        # W6: a move into the past is still held, but no longer news.
+        result["held"] = sum(1 for _e, _n, ev in held.values()
+                             if _event_day(ev) >= today)
         if held:
             stand_ins = set(held)
             for enc, n, ev in held.values():
-                loc = _resolve_moved_session(by_day, enc, n, ev)
+                loc, _ = _resolve_moved_session(by_day, enc, n, ev, names)
                 if loc is not None:
                     stand_ins.add(f"{_ID_ROOT}{profile_id}:{loc[0]}:{loc[1]}")
             desired = [ev for ev in desired
@@ -731,9 +842,14 @@ def reconcile(horizon_days: int = HORIZON_DAYS) -> dict:
             ev = ours.get(eid)
             if ev is not None:
                 day, n = eid.rsplit(":", 2)[-2:]
-                if _still_this_workout(by_day[day][int(n)], ev):
+                if _still_this_workout(by_day[day][int(n)], ev, by_day):
                     spared.add(eid)
-        protected = desired_ids | spared | set(held)
+        # W1 (qa_code H1): an agreed move's event goes only once the session's
+        # new id is in this upsert — while that id is held, a stand-in or
+        # unbuildable, the rider's event is the only copy of the workout.
+        kept = {eid for eid, new_id in agreed.items()
+                if new_id not in desired_ids}
+        protected = desired_ids | spared | set(held) | kept
         orphans = [ev for eid, ev in ours.items() if eid not in protected]
         if orphans:
             status, body = _http(
@@ -755,21 +871,25 @@ def reconcile(horizon_days: int = HORIZON_DAYS) -> dict:
             "EVENT=icu_calendar_push pushed=%d updated=%d deleted=%d "
             "skipped=%d held=%d horizon=%dd",
             result["pushed"], result["updated"], result["deleted"],
-            len(skipped), len(held), horizon_days)
+            len(skipped), result["held"], horizon_days)
         return result
     except Exception as e:                      # G4: zero 500s, ever
         _log.exception("icu calendar reconcile failed")
         return _result(error=f"internal:{type(e).__name__}")
 
 
-@_one_at_a_time
 def sweep_all(horizon_days: int = HORIZON_DAYS) -> dict:
-    """G-A: delete ALL of our pushed events in [today, today+horizon].
+    """G-A: delete ALL of our pushed events dated [today, today+horizon+7].
 
     Used when the sync toggle turns OFF and (best-effort, BEFORE the token
     purge) on disconnect. Only our profile-prefixed events are touched —
-    held rider moves included (toggle off means everything ours goes; its
-    window is deliberately not widened by #28). Never raises."""
+    held rider moves included, also those moved up to 7 days past the
+    horizon (W7: toggle off means everything ours goes). Past days are
+    never touched. Waits up to 120 s for a running reconcile. Never raises."""
+    return _one_at_a_time(_SWEEP_LOCK_TIMEOUT_S, _sweep_all, horizon_days)
+
+
+def _sweep_all(horizon_days: int) -> dict:
     from profile_manager import ProfileManager
     try:
         pm = ProfileManager.get()
@@ -780,7 +900,8 @@ def sweep_all(horizon_days: int = HORIZON_DAYS) -> dict:
         if err:
             return _result(error=err)
         today = clock.today()
-        existing, err_res = _get_window_events(athlete_id, today, horizon_days)
+        existing, err_res = _get_window_events(
+            athlete_id, today, horizon_days, 0, _LOOKAHEAD_DAYS)
         if err_res is not None:
             return err_res
         ours = _ours_in_window(existing, profile_id, today)
