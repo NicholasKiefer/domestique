@@ -1857,15 +1857,21 @@ def api_profile_update_ftp(body: dict):
     try:
         pm.record_ftp_test(method=method, ftp=new_ftp, source=source, applied=applied)
         if applied:
+            # No mirror onto config. `config.ATHLETE_FTP_W` is a PROXY
+            # (config.__getattr__, config.py:118) that resolves through
+            # ProfileManager on every read, so the write above IS the refresh
+            # the v2.2.9 mirror was added for, back when config cached its
+            # values at startup.
+            #
+            # Assigning it was worse than redundant: Python consults
+            # __getattr__ only when the module has no real attribute, so that
+            # one line turned the proxy off for the life of the process and
+            # across profile switches. A rider who tested at 300 and then set
+            # 260 in settings saw 300 in the FTP field and 260 in the power
+            # zones of the same response, and got .zwo files written at 300.
+            # training.py's credential swaps hit the same hazard and already
+            # `del` in a finally (v4.5.2 FIX-CREDS-HOTRELOAD).
             pm.update_ftp(new_ftp, source=ftp_source_tag)
-            # v2.2.9 FIX — mirror onto the LIVE config so the topbar, settings
-            # field and readiness reflect the new FTP immediately. update_ftp
-            # writes athlete.json, but the running process keeps the
-            # ATHLETE_FTP_W it cached at startup; without this refresh the saved
-            # FTP appears to "revert" to the old value (e.g. an eFTP) in the UI
-            # until the app restarts — even though athlete.json + the graph are
-            # correct. Matches what the general /api/settings save already does.
-            config.ATHLETE_FTP_W = new_ftp
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     return {"ok": True, "ftp": pm.ftp,
@@ -13301,7 +13307,18 @@ def api_plan_daily_adapt():
             return {"action": "no_current_week", "projection_only": True}
 
         actual = _collect_week_activities(current_week, today, include_today=False)
-        _unchanged, info = tp.daily_adapt_plan(current_week, actual, today)
+        # The rider's TSB, from its owner. It was not passed, so the
+        # TSB-aware de-load inside daily_adapt_plan -- ease the hard days when
+        # form is below -30 -- could never fire on the only path that calls
+        # it: the parameter defaulted to None and the branch was dead in
+        # production while every card on the page showed the number.
+        try:
+            tsb = _fitness_state()["tsb"]
+        except Exception:
+            # Form unknown is not a failed projection: no de-load, as before.
+            _log.debug("daily-adapt: fitness state unavailable", exc_info=True)
+            tsb = None
+        _unchanged, info = tp.daily_adapt_plan(current_week, actual, today, tsb=tsb)
         info["projection_only"] = True  # defensive: re-mark in case caller strips
         return info
 
