@@ -13365,11 +13365,9 @@ async function pgDrop(e, dstDay, dstWeekIdx) {
     });
     const data = await res.json();
     if (!res.ok || !data.ok) {
-      // v4.3.0 B1 — friendly toast for the structured 422.
-      const friendly = (res.status === 422 && data && data.error === 'source_session_not_found')
-        ? "Couldn't find that session. Try refreshing."
-        : `Move failed: ${data.error || data.detail || 'unknown'}`;
-      try { showToast(friendly, 3500); } catch(_) {}
+      // v4.3.0 B1 / #27 W11: the structured 422 codes read as a sentence, a
+      // refused drop (409) shows its own sentence.
+      try { showToast(_moveToastText(data, srcName, dstName, srcDayLabel, dstDayLabel), 3500); } catch(_) {}
       return;
     }
     try { showToast(_moveToastText(data, srcName, dstName, srcDayLabel, dstDayLabel), 3000); } catch(_) {}
@@ -14852,10 +14850,21 @@ function calDragEnd(e) {
 // #27: a drop on another training day swaps the two sessions; the toast says
 // where each one went. Not "Swap": that names the re-draw button and the
 // swap-type pin. {B} comes from the view's own lookup, else from the server.
+// W11: a refused or failed drop (no ok:true) is worded here too, so both views
+// say the same thing and a structured 422 code never reaches the rider.
 function _moveToastText(data, srcName, dstName, srcDayLabel, dstDayLabel) {
-  const sw = data && data.swapped;
+  if (!data || data.ok !== true) {
+    const err = data && data.error;
+    if (err === 'source_session_not_found') return "Couldn't find that session. Try refreshing.";
+    if (err === 'target_week_not_found') return 'That day is outside your plan.';
+    return err ? `Move failed: ${err}` : 'Move failed.';
+  }
+  const sw = data.swapped;
   if (sw) {
     const other = dstName || sw.zwo_name || String(sw.session_type || '').toUpperCase() || 'session';
+    // W12: a skipped session stays skipped where it lands (nothing is sent to
+    // the watch for it), so don't make it sound like it is back on.
+    if (sw.status === 'dismissed') return `Moved ${srcName} to ${dstDayLabel}; ${other} (skipped) is now on ${srcDayLabel}`;
     return `Moved ${srcName} to ${dstDayLabel} and ${other} to ${srcDayLabel}`;
   }
   return `Moved ${srcName} from ${srcDayLabel} to ${dstDayLabel}`;
@@ -14907,15 +14916,10 @@ async function calDrop(e, dstDay, dstWeekIdx) {
     });
     let data = {};
     try { data = await res.json(); } catch(_) {}
-    if (!res.ok || data.ok === false) {
-      // v4.3.0 B1: friendly toast for the structured 422 source-not-found.
-      if (res.status === 422 && data && data.error === 'source_session_not_found') {
-        try { showToast("Couldn't find that session. Try refreshing.", 3500); } catch(_) {}
-      } else {
-        // #27: a refused drop (409) carries a plain sentence; show it.
-        const why = data && data.error ? `Move failed: ${data.error}` : 'Move failed.';
-        try { showToast(why, 3000); } catch(_) {}
-      }
+    if (!res.ok || !data.ok) {
+      // v4.3.0 B1 / #27 W11: the structured 422 codes read as a sentence, a
+      // refused drop (409) shows its own sentence.
+      try { showToast(_moveToastText(data, srcName, dstName, srcDayLabel, dstDayLabel), 3500); } catch(_) {}
       return;
     }
     try { showToast(_moveToastText(data, srcName, dstName, srcDayLabel, dstDayLabel), 3000); } catch(_) {}
