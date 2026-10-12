@@ -1,5 +1,6 @@
-"""#28 step 1 — the calendar push stops undoing and deleting workouts the
-rider moved in intervals.icu.
+"""#28 step 1 + #27's duplicate guard — the calendar push stops undoing and
+deleting workouts the rider moved in intervals.icu, and a swap never leaves
+one workout on two days.
 
 Hermetic like tests/test_icu_push.py (stubbed HOME, ICU only through a fake
 behind ``icu_calendar_push._http``). FakeICU ignores the GET window, so a
@@ -12,7 +13,7 @@ Plans are fixtures in the stored shapes: a drag onto a rest day leaves a
 ``user_moved``/``moved_from`` and no stub. Nothing here depends on the
 mutator in app.py.
 
-Coverage (MASTER_DECISIONS §7): B1-B10, B12-B15; C2 — at most one of our
+Coverage (MASTER_DECISIONS §7): B1-B10, B12-B15, C1; C2 — at most one of our
 events per workout in [today-7, today+21] unless the rider made the copy —
 is checked at the end of every #28 test, and B13 (reconcile never writes the
 plan) on every reconcile through ``_run``. B11 is the unchanged existing
@@ -610,6 +611,65 @@ def test_b15_busy_after_the_timeout(env, monkeypatch):
         icp._RECONCILE_LOCK.release()
     assert env.fk.calls == []
     assert icp.reconcile()["pushed"] == 1               # free again
+
+
+# ── C1 (#27, MASTER §4.1): an unbuildable swap partner never duplicates ──────
+
+def test_c1_swap_with_fileless_partner_leaves_one_copy(env):
+    ss = _week(wed="steady.zwo", thu="")
+    _seed(env, ss)                                      # WED:0 steady; Thu unmatched
+    _write_plan(_swap(ss, D["wed"], D["thu"]))
+    r = _run(env)
+    assert {"day": D["wed"], "reason": "unmatched"} in r["skipped"]
+    assert _counts(r) == (1, 0, 1)
+    assert env.fk.files_on() == {D["thu"]: ["steady"]}
+    _one_event_per_session(env)
+
+
+def test_c1_swap_with_missing_file_partner_puts_nothing_on_the_wrong_day(env):
+    ss = _week(wed="steady.zwo", thu="tempo_alt.zwo")
+    _seed(env, ss)
+    _write_plan(_swap(ss, D["wed"], D["thu"]))
+    (env.workouts / "tempo_alt.zwo").rename(env.workouts / "tempo_alt.bak")
+    r = _run(env)
+    assert {"day": D["wed"], "reason": "file_missing"} in r["skipped"]
+    assert _counts(r) == (0, 1, 1)
+    assert env.fk.files_on() == {D["thu"]: ["steady"]}
+    _one_event_per_session(env)
+
+
+def test_c1_hr_swap_with_trailing_open_partner_leaves_one_copy(env):
+    env.pm._athlete.update({"target_mode": "hr", "lthr": 160, "max_hr": 185})
+    ss = _week(wed="steady.zwo", thu="sprint_end.zwo")
+    _seed(env, ss)                                      # WED:0 steady.fit; Thu trailing_open
+    assert env.fk.files_on() == {D["wed"]: ["steady"]}
+    _write_plan(_swap(ss, D["wed"], D["thu"]))
+    r = _run(env)
+    assert {"day": D["wed"], "reason": "trailing_open"} in r["skipped"]
+    assert env.fk.files_on() == {D["thu"]: ["steady"]}
+    _one_event_per_session(env)
+
+
+@pytest.mark.parametrize("echo", [True, False])
+def test_c1_library_outage_on_unmoved_session_keeps_its_event(env, echo):
+    env.fk.echo_filename = echo
+    _seed(env, _week(wed="steady.zwo"))
+    (env.workouts / "steady.zwo").rename(env.workouts / "steady.bak")
+    r = _run(env)
+    assert {"day": D["wed"], "reason": "file_missing"} in r["skipped"]
+    assert r["deleted"] == 0 and env.fk.files_on() == {D["wed"]: ["steady"]}
+
+
+def test_c1_moved_session_keeps_its_own_event_through_a_build_failure(env):
+    """Same workout at the id (steady.fit vs steady.zwo compare by stem):
+    a session pushed after its move keeps its event when lthr breaks."""
+    env.pm._athlete.update({"target_mode": "hr", "lthr": 160, "max_hr": 185})
+    _seed(env, _move(_week(wed="steady.zwo"), D["wed"], D["fri"]))
+    assert env.fk.files_on() == {D["fri"]: ["steady"]}
+    env.pm._athlete.update({"max_hr": 150})             # lthr invariant broken
+    r = _run(env)
+    assert r.get("needs_lthr") is True
+    assert r["deleted"] == 0 and env.fk.files_on() == {D["fri"]: ["steady"]}
 
 
 if __name__ == "__main__":

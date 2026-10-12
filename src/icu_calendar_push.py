@@ -37,6 +37,9 @@ Contract highlights (GRILL OUTCOME — LOCKED, /tmp/IP_ICU_PUSH.md):
       * one event per session: the session a held event stands for is not
         pushed anywhere else (found through its moved_from chain); no bumped
         id is ever minted.
+  - broken_ids (#27): an unbuildable session spares its slot's event only
+    while that event still carries this session's workout — after a swap
+    the slot's old event is the other session's.
   - One reconcile / sweep_all at a time (module lock; 60 s, then "busy").
   - Toast counts derive from the local diff vs the pre-upsert GET, not from
     ICU response fields (G-G).
@@ -320,6 +323,8 @@ def _desired_events(pm, plan: dict, today: date, horizon_days: int,
       broken_ids — external_ids of sessions we WANTED to push but could not
                    build; the sweep spares these so a config hiccup (e.g. a
                    broken lthr) never deletes previously-pushed events.
+                   (#27: reconcile spares one only while the event at that
+                   id is still this session's workout.)
     """
     import app as _app
 
@@ -592,6 +597,19 @@ def _resolve_moved_session(by_day: dict, enc: str, n: int, ev: dict):
     return None
 
 
+def _still_this_workout(s: dict, ev: dict) -> bool:
+    """#27 (MASTER §4.1): may the sweep spare the event at an unbuildable
+    session's id? Only while that event is this session's workout. After a
+    swap the slot's prior event carries the OTHER session — sparing it put
+    one workout on two days (or the wrong day) on the watch. Unknown on
+    either side → the old rule for a session that never moved (a library
+    outage on an unmoved session still keeps its event)."""
+    have, there = _stem(s.get("zwo_file")), _stem(ev.get("filename"))
+    if have and there:
+        return have == there
+    return not s.get("moved_from")
+
+
 # #28 (grill_cal M-3): the sync thread, the 30 s debounce timer and the Push
 # button can each start a reconcile; two overlapping bulk upserts of a new
 # external_id could leave two events under one id. One run at a time.
@@ -704,10 +722,18 @@ def reconcile(horizon_days: int = HORIZON_DAYS) -> dict:
                   or (prev.get("filename") and str(prev["filename"]) != ev["filename"])):
                 result["updated"] += 1
 
-        # Orphan sweep — ours minus (desired ∪ broken ∪ held). Skipped
+        # Orphan sweep — ours minus (desired ∪ spared broken ∪ held). Skipped
         # entirely when the upsert failed (returns above); broken sessions
-        # keep their prior event rather than losing it to a build hiccup.
-        protected = desired_ids | broken_ids | set(held)
+        # keep their prior event rather than losing it to a build hiccup —
+        # while it is still their workout (#27).
+        spared = set()
+        for eid in broken_ids:
+            ev = ours.get(eid)
+            if ev is not None:
+                day, n = eid.rsplit(":", 2)[-2:]
+                if _still_this_workout(by_day[day][int(n)], ev):
+                    spared.add(eid)
+        protected = desired_ids | spared | set(held)
         orphans = [ev for eid, ev in ours.items() if eid not in protected]
         if orphans:
             status, body = _http(
