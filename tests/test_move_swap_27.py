@@ -20,6 +20,7 @@ import copy
 import json
 import subprocess
 import sys
+import threading
 from collections import Counter
 from contextlib import contextmanager
 from datetime import date, timedelta
@@ -35,7 +36,7 @@ import training_planner as tp
 
 MON = date(2026, 10, 12)  # a Monday
 RIDDEN = "That day has already been ridden."
-TWO_ROWS = "Days with two sessions can't be moved here — open the day to change them."
+TWO_ROWS = "Days with two sessions can't be changed by dragging yet."
 
 
 def _d(i: int, start: date = MON) -> str:
@@ -330,6 +331,29 @@ def test_a_rest_like_target_still_moves_and_vacates(api, frozen, target):
     assert on[_d(3)]["status"] == f"moved_from:{_d(4)}"
 
 
+# ── W14: a rest day or a stub is not a session to drag ──────────────────────
+
+@pytest.mark.parametrize("source", ["rest", "stub"])
+def test_a_rest_day_or_a_stub_is_not_a_session_to_drag(api, frozen, source):
+    frozen(MON)
+    plan = _week(["rest", "z2", "sweetspot", "vo2max", "rest", "long_z2", "rest"])
+    sessions = plan["weeks"][0]["sessions"]
+    if source == "stub":
+        sessions[4] = dict(sessions[4], status=f"moved_from:{_d(5)}", description=f"Moved to {_d(5)}")
+    raw = api.write(plan)
+
+    # Onto a training day (it would swap) and onto a rest day (it would move).
+    for dst in (_d(3), _d(6)):
+        r = api.post(_d(4), dst)
+        assert r.status_code == 422, r.text
+        assert r.json() == {"error": "source_session_not_found", "date": _d(4)}
+        assert api.path.read_bytes() == raw
+
+        p = copy.deepcopy(plan)
+        assert app._apply_move_session(p, _d(4), dst) is None
+        assert p == plan
+
+
 # ── A13: a swap across two stored weeks of one ISO week ─────────────────────
 
 def test_a_swap_across_fri_thu_stored_weeks(api, frozen):
@@ -360,6 +384,11 @@ def test_a_swap_across_fri_thu_stored_weeks(api, frozen):
 
 # ── A15: the endpoint holds the plan lock across its read and its write ────
 
+# The endpoint's own frames: its locked read -> mutate -> write runs in a
+# nested function on a worker thread (W15).
+_ENDPOINT_FRAMES = ("api_plan_move_session", "_move_under_plan_lock")
+
+
 def test_the_endpoint_reads_and_writes_inside_one_hold_of_the_plan_lock(api, frozen, monkeypatch):
     frozen(MON)
     api.write(_week(["rest", "z2", "sweetspot", "vo2max", "rest", "long_z2", "rest"]))
@@ -384,12 +413,12 @@ def test_the_endpoint_reads_and_writes_inside_one_hold_of_the_plan_lock(api, fro
     # readers (the boot-time self-heal runs on a worker thread) are not the
     # read-modify-write under test.
     def rec_load(f, *a, **k):
-        if sys._getframe(1).f_code.co_name == "api_plan_move_session":
+        if sys._getframe(1).f_code.co_name in _ENDPOINT_FRAMES:
             state["events"].append(("read", held()))
         return real_load(f, *a, **k)
 
     def rec_write(path, plan):
-        if sys._getframe(1).f_code.co_name == "api_plan_move_session":
+        if sys._getframe(1).f_code.co_name in _ENDPOINT_FRAMES:
             state["events"].append(("write", held()))
         return real_write(path, plan)
 
@@ -403,6 +432,34 @@ def test_the_endpoint_reads_and_writes_inside_one_hold_of_the_plan_lock(api, fro
     assert reads and writes, state["events"]
     assert None not in reads + writes, state["events"]
     assert set(reads) == set(writes) and len(set(writes)) == 1, state["events"]
+
+
+# ── W15: the move waits for the plan lock off the event loop ───────────────
+
+def test_the_move_waits_for_the_plan_lock_off_the_event_loop(api, frozen, monkeypatch):
+    # A background adapt can hold the plan lock for a whole plan update. The
+    # move's locked read/write must wait on a worker thread, not on the event
+    # loop thread that serves every other request.
+    frozen(MON)
+    api.write(_week(["rest", "z2", "sweetspot", "vo2max", "rest", "long_z2", "rest"]))
+    real_body, real_load = app._get_json_body, json.load
+    seen = {"loop": None, "locked": []}
+
+    async def rec_body(request):
+        seen["loop"] = threading.get_ident()      # body parsing stays on the loop
+        return await real_body(request)
+
+    def rec_load(f, *a, **k):
+        if sys._getframe(1).f_code.co_name in _ENDPOINT_FRAMES:
+            seen["locked"].append(threading.get_ident())
+        return real_load(f, *a, **k)
+
+    monkeypatch.setattr(app, "_get_json_body", rec_body)
+    monkeypatch.setattr(json, "load", rec_load)
+
+    assert api.post(_d(1), _d(2)).status_code == 200
+    assert seen["loop"] is not None and seen["locked"], seen
+    assert seen["loop"] not in seen["locked"], seen
 
 
 # ── D1 (owner O4): a rider-moved session keeps its length ──────────────────
@@ -510,6 +567,40 @@ console.log(JSON.stringify([
     assert not any("swap" in t.lower() for t in out)
 
 
+def test_the_toast_helper_names_a_skipped_partner_as_skipped():
+    # W12: a dismissed partner travels dismissed; nothing goes to the watch for
+    # it, so the toast must not read as if it were back on.
+    out = _node(_fn("_moveToastText") + """
+console.log(JSON.stringify([
+  _moveToastText({ok: true, swapped: {zwo_name: 'server B', status: 'dismissed'}}, 'A', 'B', 'Tuesday', 'Wednesday'),
+  _moveToastText({ok: true, swapped: {session_type: 'z2', status: 'dismissed'}}, 'A', '', 'Tue', 'Wed'),
+  _moveToastText({ok: true, swapped: {zwo_name: 'server B', status: 'missed'}}, 'A', 'B', 'Tuesday', 'Wednesday'),
+]));
+""")
+    assert out == ["Moved A to Wednesday; B (skipped) is now on Tuesday",
+                   "Moved A to Wed; Z2 (skipped) is now on Tue",
+                   "Moved A to Wednesday and B to Tuesday"]
+
+
+def test_the_toast_helper_never_shows_a_raw_code():
+    # W11: the structured 422 codes read as a sentence; a refusal's own
+    # sentence is shown; anything else is a plain failure.
+    out = _node(_fn("_moveToastText") + """
+console.log(JSON.stringify([
+  _moveToastText({error: 'source_session_not_found', date: '2026-10-13'}, 'A', 'B', 'Tue', 'Wed'),
+  _moveToastText({error: 'target_week_not_found', date: '2026-12-03'}, 'A', 'B', 'Tue', 'Wed'),
+  _moveToastText({error: 'That day has already been ridden.'}, 'A', 'B', 'Tue', 'Wed'),
+  _moveToastText({detail: 'Move failed'}, 'A', 'B', 'Tue', 'Wed'),
+  _moveToastText({}, 'A', 'B', 'Tue', 'Wed'),
+]));
+""")
+    assert out == ["Couldn't find that session. Try refreshing.",
+                   "That day is outside your plan.",
+                   "Move failed: That day has already been ridden.",
+                   "Move failed.",
+                   "Move failed."]
+
+
 _DROP_ENV = """
 global.HTMLElement = Object;
 const toasts = [];
@@ -543,6 +634,12 @@ global.window = { _calData: { weeks: [ { days: [
   await calDrop(ev('2026-10-13', 'cal-dropping-valid'), '2026-10-14', 0);
   respond(500, { detail: 'Move failed' });
   await calDrop(ev('2026-10-13', 'cal-dropping-valid'), '2026-10-14', 0);
+  respond(422, { error: 'target_week_not_found', date: '2026-10-14' });
+  await calDrop(ev('2026-10-13', 'cal-dropping-valid'), '2026-10-14', 0);
+  respond(422, { error: 'source_session_not_found', date: '2026-10-13' });
+  await calDrop(ev('2026-10-13', 'cal-dropping-valid'), '2026-10-14', 0);
+  respond(200, { ok: true, moved: {}, vacated: null, swapped: { zwo_name: 'ss_2x20', status: 'dismissed' } });
+  await calDrop(ev('2026-10-13', 'cal-dropping-valid'), '2026-10-14', 0);
   console.log(JSON.stringify(toasts));
 })();
 """
@@ -551,6 +648,9 @@ global.window = { _calData: { weeks: [ { days: [
         "Moved Endurance 60 from Tuesday to Wednesday",
         "Move failed: That day has already been ridden.",
         "Move failed.",
+        "That day is outside your plan.",
+        "Couldn't find that session. Try refreshing.",
+        "Moved Endurance 60 to Wednesday; Sweet Spot 2x20 (skipped) is now on Tuesday",
     ]
 
 
@@ -563,12 +663,71 @@ global.window = { _planData: { weeks: [ { sessions: [
 (async () => {
   respond(200, { ok: true, moved: {}, vacated: null, swapped: { zwo_name: 'server name' } });
   await pgDrop(ev('2026-10-13', 'pg-dropping-valid'), '2026-10-14', 0);
-  respond(409, { error: "Days with two sessions can't be moved here — open the day to change them." });
+  respond(409, { error: "Days with two sessions can't be changed by dragging yet." });
+  await pgDrop(ev('2026-10-13', 'pg-dropping-valid'), '2026-10-14', 0);
+  respond(422, { error: 'target_week_not_found', date: '2026-10-14' });
+  await pgDrop(ev('2026-10-13', 'pg-dropping-valid'), '2026-10-14', 0);
+  respond(422, { error: 'source_session_not_found', date: '2026-10-13' });
+  await pgDrop(ev('2026-10-13', 'pg-dropping-valid'), '2026-10-14', 0);
+  respond(500, { detail: 'Move failed' });
+  await pgDrop(ev('2026-10-13', 'pg-dropping-valid'), '2026-10-14', 0);
+  respond(200, { ok: true, moved: {}, vacated: null, swapped: { zwo_name: 'server name', status: 'dismissed' } });
   await pgDrop(ev('2026-10-13', 'pg-dropping-valid'), '2026-10-14', 0);
   console.log(JSON.stringify(toasts));
 })();
 """
     assert _node(js) == [
         "Moved Endurance 60 to Wed and SWEETSPOT to Tue",
-        "Move failed: Days with two sessions can't be moved here — open the day to change them.",
+        "Move failed: Days with two sessions can't be changed by dragging yet.",
+        "That day is outside your plan.",
+        "Couldn't find that session. Try refreshing.",
+        "Move failed.",
+        "Moved Endurance 60 to Wed; SWEETSPOT (skipped) is now on Tue",
     ]
+
+
+# ── W16: a "busy" debounced calendar push is re-armed once ──────────────────
+
+def test_a_busy_debounced_calendar_push_is_re_armed_once(monkeypatch):
+    import icu_calendar_push as icp
+    from profile_manager import ProfileManager
+
+    monkeypatch.setattr(app, "_icu_push_sync_enabled", lambda: True)
+    monkeypatch.setattr(ProfileManager, "get",
+                        staticmethod(lambda: SimpleNamespace(active_id="pid-w16")))
+    monkeypatch.setattr(app, "_icu_push_last_result", None)
+    monkeypatch.setattr(app, "_icu_push_timer", None)
+    result = {"res": {"error": "busy"}}
+    monkeypatch.setattr(icp, "reconcile", lambda: result["res"])
+
+    def armed():
+        t = app._icu_push_timer
+        if t is not None:
+            t.cancel()
+            app._icu_push_timer = None
+        return t
+
+    try:
+        app._icu_push_debounced_run("pid-w16")
+        t = armed()
+        assert t is not None and t.args == ("pid-w16", True)  # re-armed, as the retry
+
+        app._icu_push_debounced_run("pid-w16", True)           # the retry is busy too
+        assert armed() is None                                  # once only
+
+        result["res"] = {"pushed": 1, "updated": 0, "deleted": 0}
+        app._icu_push_debounced_run("pid-w16")
+        assert armed() is None                                  # only "busy" re-arms
+
+        # A newer plan write armed its own timer while this run waited: keep it.
+        newer = SimpleNamespace(cancel=lambda: None)
+
+        def busy_after_a_new_write():
+            app._icu_push_timer = newer
+            return {"error": "busy"}
+
+        monkeypatch.setattr(icp, "reconcile", busy_after_a_new_write)
+        app._icu_push_debounced_run("pid-w16")
+        assert app._icu_push_timer is newer
+    finally:
+        armed()

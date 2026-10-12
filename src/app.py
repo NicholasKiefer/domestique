@@ -7794,7 +7794,7 @@ def _icu_push_sync_enabled() -> bool:
         return False
 
 
-def _icu_push_debounced_run(expected_pid: str) -> None:
+def _icu_push_debounced_run(expected_pid: str, retried: bool = False) -> None:
     global _icu_push_timer
     with _icu_push_timer_lock:
         _icu_push_timer = None
@@ -7822,6 +7822,18 @@ def _icu_push_debounced_run(expected_pid: str) -> None:
                   res.get("pushed"), res.get("updated"), res.get("deleted"),
                   res.get("needs_reconnect"), res.get("error"),
                   res.get("error_detail"))
+        # #28 W16: "busy" = another reconcile held the calendar lock past
+        # the wait, so the plan write this run was armed for never reached
+        # intervals.icu, and the next trigger can be tomorrow's daily run.
+        # Re-arm once; a timer a newer plan write armed meanwhile covers it.
+        if res.get("error") == "busy" and not retried:
+            with _icu_push_timer_lock:
+                if _icu_push_timer is None:
+                    t = threading.Timer(ICU_PUSH_DEBOUNCE_S, _icu_push_debounced_run,
+                                        args=(expected_pid, True))
+                    t.daemon = True
+                    _icu_push_timer = t
+                    t.start()
     except Exception:
         _log.warning("debounced ICU calendar push failed", exc_info=True)
 
@@ -13359,7 +13371,8 @@ def _apply_move_session(
     a ``moved_from:`` stub or an empty day is taken as before. A rider's move
     is refused (None, plan untouched) when either day was ridden (status
     done / done_partial / ambiguous) or holds more than one row in its
-    stored week. ``auto=True`` keeps the overwrite: the auto-reschedule
+    stored week, or when the source is a rest day or a ``moved_from:`` stub
+    rather than a session. ``auto=True`` keeps the overwrite: the auto-reschedule
     takeover writes off the easy day by design and its undo relies on the
     stub.
     """
@@ -13414,6 +13427,14 @@ def _apply_move_session(
                for s in (src_session, dst_session)):
             return None
         if len(src_here) > 1 or len(dst_here) > 1:
+            return None
+        # #27 W14: a rider drags a session, never a rest day or the stub a
+        # move left. Swapped onto a training day, a stub would carry its
+        # "moved_from:" pointer to a day it does not describe, and the
+        # calendar push follows that pointer (#28). The views never drag
+        # either; a stale client or the raw API can.
+        if ((src_session.get("session_type") or "") == "rest"
+                or str(src_session.get("status") or "").startswith("moved_from:")):
             return None
 
     def _landed(sess: dict, day_iso: str, day_name: str, from_iso: str) -> dict:
@@ -13921,6 +13942,8 @@ async def api_plan_move_session(request: Request):
       (both pinned `user_moved`, each `moved_from` the day it left) and
       nothing is vacated. A ridden day or a day with two sessions is refused
       with 409 and a plain sentence in `error`; the plan is not written.
+      A rest day or a `moved_from:` stub is not a session to move: 422
+      `source_session_not_found`, as for an empty day.
     - §6.12: regenerate_from_today honors user_moved=True — never re-prescribed.
 
     Returns `{"ok": true, "moved": <session now on new_date>,
@@ -13943,10 +13966,13 @@ async def api_plan_move_session(request: Request):
     if src_iso == dst_iso:
         return JSONResponse({"error": "date and new_date must differ"}, 400)
 
-    try:
+    def _move_under_plan_lock():
         # #27: read -> mutate -> write under the plan-write lock the ride
         # sync holds (rematch pattern): a swap rewrites two days, and a
         # sync's read-modify-write in between would revert one of them.
+        # W15: this runs on a worker thread (below). A background adapt can
+        # hold the lock for a whole plan update; waiting for it on the event
+        # loop would stall every other request until then.
         with tp.plan_write_lock():
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
@@ -14052,8 +14078,8 @@ async def api_plan_move_session(request: Request):
                         if s.get("day") == dst_iso]
             if len(src_rows) > 1 or len(dst_rows) > 1:
                 return JSONResponse(
-                    {"error": "Days with two sessions can't be moved here — "
-                              "open the day to change them."},
+                    {"error": "Days with two sessions can't be changed by "
+                              "dragging yet."},
                     409,
                 )
             if any(str(s.get("status") or "") in _RIDDEN_RANK
@@ -14062,8 +14088,9 @@ async def api_plan_move_session(request: Request):
                     {"error": "That day has already been ridden."}, 409
                 )
 
-            # Mutation is shared with the auto-reschedule path (_apply_move_session)
-            # so both apply the identical same-week relocation + rest-stub rewrite.
+            # Mutation is shared with the auto-reschedule path (_apply_move_session):
+            # one same-week relocation. A rider's drop onto a training day swaps
+            # (#27); the auto path keeps its overwrite + rest stub.
             moved_payload = _apply_move_session(plan, src_iso, dst_iso)
             if moved_payload is None:
                 return JSONResponse(
@@ -14084,6 +14111,9 @@ async def api_plan_move_session(request: Request):
         return {"ok": True, "moved": moved_payload, "vacated": vacated,
                 "swapped": swapped}
 
+    try:
+        from starlette.concurrency import run_in_threadpool
+        return await run_in_threadpool(_move_under_plan_lock)
     except Exception:
         _log.exception("Plan move-session failed")
         return JSONResponse({"detail": "Move failed"}, 500)
