@@ -8066,6 +8066,23 @@ def api_calendar_push_workout(body: "dict | None" = None):
             return {"error": "date_out_of_range"}
         date_iso = target.isoformat()
 
+        def _send(events):
+            # ONE bulk upsert (idempotent on external_id) via the engine's own
+            # seam — the SAME transport reconcile uses, so 403-scope maps to
+            # needs_reconnect.
+            status, resp = _icp._http(
+                "POST", f"athlete/{athlete_id}/events/bulk?upsert=true",
+                payload=events)
+            if _icp._scope_403(status, resp):
+                return {"needs_reconnect": True}
+            if status == 0:
+                return {"error": "network"}
+            if not (200 <= status < 300):
+                return {"error": f"http_{status}"}
+            _log.info("EVENT=icu_calendar_push_workout source=%s date=%s pushed=1",
+                      source, date_iso)
+            return {"ok": True, "pushed": 1, "event_date": date_iso}
+
         workout_dir = Path(active_workout_dir())
         if source == "library":
             # amendment 5: zwo_file is CLIENT-supplied → reject traversal BEFORE
@@ -8090,8 +8107,11 @@ def api_calendar_push_workout(body: "dict | None" = None):
                 hr_mode, lthr_ok)
             if event is None:
                 return {"error": reason}
-            events = [event]
-        else:  # planner
+            return _send([event])
+
+        def _push_planned():
+            # #28: read the plan, the window and push under the reconcile
+            # lock, so a reconcile this waited for is seen whole.
             plan = _icp._load_plan()
             if plan is None:
                 return {"error": "no_plan"}
@@ -8119,33 +8139,10 @@ def api_calendar_push_workout(body: "dict | None" = None):
                 if reason == "needs_lthr":
                     return {"needs_lthr": True}
                 return {"error": "not a pushable planned session"}
-            events = [event]
-
-        def _send():
-            # ONE bulk upsert (idempotent on external_id) via the engine's own
-            # seam — the SAME transport reconcile uses, so 403-scope maps to
-            # needs_reconnect.
-            status, resp = _icp._http(
-                "POST", f"athlete/{athlete_id}/events/bulk?upsert=true",
-                payload=events)
-            if _icp._scope_403(status, resp):
-                return {"needs_reconnect": True}
-            if status == 0:
-                return {"error": "network"}
-            if not (200 <= status < 300):
-                return {"error": f"http_{status}"}
-            _log.info("EVENT=icu_calendar_push_workout source=%s date=%s pushed=1",
-                      source, date_iso)
-            return {"ok": True, "pushed": 1, "event_date": date_iso}
-
-        if source == "library":
-            return _send()
-
-        def _send_unless_moved():
             # #28: the upsert is keyed by external_id, which a drag in the
             # intervals.icu calendar keeps — pushing blindly pulled a workout
             # the rider moved there back to its planned day. Read the window
-            # first, under the reconcile lock, and leave it where they put it.
+            # first and leave it where they put it.
             kept_on, err_res = _icp.moved_copy_day(
                 athlete_id, plan, event["external_id"], profile_id, horizon)
             if err_res is not None:
@@ -8156,9 +8153,9 @@ def api_calendar_push_workout(body: "dict | None" = None):
                 _log.info("EVENT=icu_calendar_push_workout source=planner "
                           "date=%s pushed=0 kept_on=%s", date_iso, kept_on)
                 return {"ok": True, "pushed": 0, "kept_on": kept_on}
-            return _send()
+            return _send([event])
 
-        return _icp._one_at_a_time(_icp._RECONCILE_LOCK_TIMEOUT_S, _send_unless_moved)
+        return _icp._one_at_a_time(_icp._RECONCILE_LOCK_TIMEOUT_S, _push_planned)
     except Exception as e:                      # amendment 7: zero 500s, ever
         _log.exception("calendar push-workout endpoint failed")
         return {"error": f"internal:{type(e).__name__}"}

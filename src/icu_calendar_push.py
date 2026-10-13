@@ -45,8 +45,9 @@ Contract highlights (GRILL OUTCOME — LOCKED, /tmp/IP_ICU_PUSH.md):
     and the id is pushed / swept as usual. Never for an event dated before
     today (past days are never re-dated or deleted).
     The planner's single "Send to intervals.icu calendar" push (the
-    push-workout endpoint) does NOT apply the hold: it is an explicit rider
-    action and writes the slot's id wherever its event was.
+    push-workout endpoint) applies the same hold through moved_copy_day,
+    under the same lock: a rider report showed the button pulling a move
+    back.
   - broken_ids (#27): an unbuildable session spares its slot's event only
     while that event still carries this session's workout — after a swap
     the slot's old event is the other session's.

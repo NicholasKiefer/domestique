@@ -3855,7 +3855,7 @@ async function _pushWorkoutToCalendar(source, zwoFile, dateIso, name) {
   } catch (e) { r = {error: 'network'}; }
   if (r && r.ok && r.kept_on) {
     // #28: the rider moved this workout in intervals.icu; it stays there.
-    showToast(`Already on your intervals.icu calendar for ${r.kept_on}, where you moved it — left there`, 6000, 'success');
+    showToast(`Already on your intervals.icu calendar for ${r.kept_on} — left where you put it`, 6000, 'success');
   } else if (r && r.ok) {
     showToast(`On your intervals.icu calendar for ${dateIso} — Garmin / Wahoo / MyWhoosh will pull it automatically`, 6000, 'success');
   } else if (r && r.error === 'busy') {

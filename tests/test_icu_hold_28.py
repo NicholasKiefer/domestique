@@ -1073,6 +1073,26 @@ def test_send_button_waits_for_a_running_calendar_update(env, monkeypatch):
     assert env.fk.calls == []
 
 
+def test_send_button_reads_the_plan_after_waiting_for_the_lock(env):
+    """The plan changed while the Send waited behind a calendar update: it
+    must act on the plan as it is now, not push the session's old day."""
+    ss = _week(wed="steady.zwo")
+    _write_plan(ss)
+    assert icp._RECONCILE_LOCK.acquire(timeout=1)
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault(
+        "r", _send(env, D["wed"], "steady.zwo")))
+    try:
+        t.start()
+        time.sleep(0.3)                                   # the Send is waiting
+        _write_plan(_move(ss, D["wed"], D["thu"]))
+    finally:
+        icp._RECONCILE_LOCK.release()
+    t.join(10)
+    assert out["r"] == {"error": "not a pushable planned session"}
+    assert [c[0] for c in env.fk.calls] == []
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 def test_send_button_toast_says_where_the_workout_stayed():
     src = DASHBOARD.read_text(encoding="utf-8")
@@ -1086,7 +1106,7 @@ global.fetch = async () => ({json: async () => replies.shift()});
 (async () => {
   for (let i = 0; i < 3; i++) await _pushWorkoutToCalendar('planner', 'a.zwo', '2026-10-19', '');
   const want = [
-    'Already on your intervals.icu calendar for 2026-10-20, where you moved it — left there',
+    'Already on your intervals.icu calendar for 2026-10-20 — left where you put it',
     'On your intervals.icu calendar for 2026-10-19 — Garmin / Wahoo / MyWhoosh will pull it automatically',
     'A calendar update is already running — try again in a moment.',
   ];
