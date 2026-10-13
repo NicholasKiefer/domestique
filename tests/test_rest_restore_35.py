@@ -67,3 +67,16 @@ def test_a_restored_ride_carries_no_old_pins():
                                   "moved_from": (MONDAY + timedelta(days=5)).isoformat()}))
     assert wed.session_type == "z2"
     assert (wed.user_moved, wed.user_swapped, wed.moved_from) == (False, False, "")
+
+
+def test_a_restored_ride_drops_marks_of_the_session_it_replaced():
+    """A stale pre_adapt would let revert-cap restore the old session over the
+    restored ride; adapted/auto_moved/tsb_eased_from describe that old one."""
+    week = _week(205, {"adapted": True, "auto_moved": True, "adapted_reason": "tier-down",
+                       "pre_adapt": {"session_type": "vo2max", "duration_min": 60},
+                       "tsb_eased_from": 90})
+    wed = _reforecast(week)
+    assert wed.session_type == "z2" and wed.adapted is False
+    stored = tp.session_to_dict(wed)
+    for key in ("auto_moved", "adapted_reason", "pre_adapt", "tsb_eased_from"):
+        assert key not in stored, key

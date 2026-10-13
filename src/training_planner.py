@@ -464,8 +464,10 @@ def _rotate_plan_backups(plan_path: "Path") -> None:
 # debounced ICU-calendar push scheduler here at boot (AFTER the boot-time
 # restore/rewrite writes); the CLI path never registers, so plain
 # `python training_planner.py` stays network-silent. Called with the plan
-# Path AFTER the atomic rename, OUTSIDE the write lock; failures are logged
-# and swallowed — a broken callback must never break a plan write.
+# Path AFTER the atomic rename, outside atomic_write_plan's own critical
+# section (a caller may still hold the plan RLock around its read-modify-write,
+# #32; the callback only arms a timer); failures are logged and swallowed — a
+# broken callback must never break a plan write.
 post_write_callback = None
 
 
@@ -12026,13 +12028,19 @@ def reforecast(
                     s.description = f"z2 ({new_dur}min) — restored from rest"
                     s.zwo_file = ""
                     s.zwo_name = ""
-                    # #35: the restored ride is the planner's. Pins left by a
-                    # session the rider once moved or swapped onto this day
-                    # (rested since, by a 0 h day) describe that session, not
-                    # this one, and would freeze it against resize and regen.
+                    # #35: the restored ride is the planner's. Pins and marks
+                    # left by a session the rider once moved, swapped or had
+                    # adapted on this day (rested since, by a 0 h day) describe
+                    # that session, not this one: pins froze it against resize
+                    # and regen, and a stale pre_adapt let revert-cap bring the
+                    # old session back over it.
                     s.user_moved = False
                     s.user_swapped = False
                     s.moved_from = ""
+                    s.adapted = False
+                    for _k in _PS_JSON_ONLY_KEYS:
+                        if hasattr(s, _k):
+                            delattr(s, _k)
                 elif getattr(s, "user_swapped", False) or getattr(s, "user_moved", False):
                     # A pinned day — swap-type, accepted redraw, FTP-test
                     # choice — keeps the workout the rider chose. Applying the

@@ -7780,9 +7780,30 @@ def _icu_push_note_result(res: dict) -> None:
     """Record a reconcile result (+timestamp) for the status endpoint."""
     global _icu_push_last_result
     try:
-        _icu_push_last_result = {"at": clock.now().isoformat(), **res}
+        # #34: remember whose calendar it was, so a profile switch does not
+        # show the previous rider's result in Settings.
+        try:
+            from profile_manager import ProfileManager
+            _pid = ProfileManager.get().active_id
+        except Exception:
+            _pid = None
+        _icu_push_last_result = {"at": clock.now().isoformat(), "profile_id": _pid, **res}
     except Exception:
         pass
+
+
+def _last_result_for_active_profile() -> "dict | None":
+    """The last reconcile result if it was this profile's (#34), else None."""
+    res = _icu_push_last_result
+    if not res:
+        return None
+    try:
+        from profile_manager import ProfileManager
+        if res.get("profile_id") != ProfileManager.get().active_id:
+            return None
+    except Exception:
+        return None
+    return res
 
 
 def _icu_push_sync_enabled() -> bool:
@@ -7953,7 +7974,7 @@ def api_icu_push_status():
         # 3.3.1 hotfix (B3b): outcome of the most recent reconcile (any
         # trigger), incl. error + error_detail — background pushes are no
         # longer silent to the UI.
-        "last_result": _icu_push_last_result,
+        "last_result": _last_result_for_active_profile(),
     }
 
 

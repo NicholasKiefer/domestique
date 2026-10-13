@@ -92,3 +92,18 @@ icuCalSyncRefresh().then(() => console.log(JSON.stringify({
         assert out["shown"] == "none"
     else:
         assert out["shown"] == "block" and out["text"].startswith(expect), out
+
+
+def test_settings_never_shows_another_profiles_push_result(monkeypatch):
+    """The last push result is global; after a profile switch Settings showed
+    the previous rider's count (review of #34)."""
+    import types
+    import app as app_module
+    import profile_manager
+    monkeypatch.setattr(app_module, "_icu_push_last_result",
+                        {"at": "x", "profile_id": "anna", "held": 2})
+    for active, expect in (("anna", 2), ("ben", None)):
+        monkeypatch.setattr(profile_manager.ProfileManager, "get",
+                            classmethod(lambda cls, a=active: types.SimpleNamespace(active_id=a)))
+        got = app_module._last_result_for_active_profile()
+        assert (got or {}).get("held") == expect, (active, got)
