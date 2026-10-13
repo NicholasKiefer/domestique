@@ -3853,8 +3853,13 @@ async function _pushWorkoutToCalendar(source, zwoFile, dateIso, name) {
                             name: name || ''})});
     r = await res.json();
   } catch (e) { r = {error: 'network'}; }
-  if (r && r.ok) {
+  if (r && r.ok && r.kept_on) {
+    // #28: the rider moved this workout in intervals.icu; it stays there.
+    showToast(`Already on your intervals.icu calendar for ${r.kept_on} — left where you put it`, 6000, 'success');
+  } else if (r && r.ok) {
     showToast(`On your intervals.icu calendar for ${dateIso} — Garmin / Wahoo / MyWhoosh will pull it automatically`, 6000, 'success');
+  } else if (r && r.error === 'busy') {
+    showToast('A calendar update is already running — try again in a moment.', 6000, 'warning');
   } else if (r && r.needs_reconnect) {
     showToast('Reconnect intervals.icu to grant calendar access', 6000, 'warning');
   } else if (r && r.needs_lthr) {
@@ -13338,7 +13343,7 @@ async function pgDrop(e, dstDay, dstWeekIdx) {
   if (!srcDay || srcDay === dstDay) return;
 
   // Find the source session's workout name for the toast (item 9)
-  let srcName = 'session', srcDayLabel = srcDay, dstDayLabel = dstDay;
+  let srcName = 'session', dstName = '', srcDayLabel = srcDay, dstDayLabel = dstDay;
   try {
     const plan = window._planData;
     if (plan && plan.weeks) {
@@ -13349,6 +13354,7 @@ async function pgDrop(e, dstDay, dstWeekIdx) {
             srcDayLabel = sess.day_name || srcDay;
           }
           if (sess.day === dstDay) {
+            dstName = sess.zwo_name || (sess.session_type || '').toUpperCase();
             dstDayLabel = sess.day_name || dstDay;
           }
         }
@@ -13364,14 +13370,12 @@ async function pgDrop(e, dstDay, dstWeekIdx) {
     });
     const data = await res.json();
     if (!res.ok || !data.ok) {
-      // v4.3.0 B1 — friendly toast for the structured 422.
-      const friendly = (res.status === 422 && data && data.error === 'source_session_not_found')
-        ? "Couldn't find that session. Try refreshing."
-        : `Move failed: ${data.error || data.detail || 'unknown'}`;
-      try { showToast(friendly, 3500); } catch(_) {}
+      // v4.3.0 B1 / #27 W11: the structured 422 codes read as a sentence, a
+      // refused drop (409) shows its own sentence.
+      try { showToast(_moveToastText(data, srcName, dstName, srcDayLabel, dstDayLabel), 3500); } catch(_) {}
       return;
     }
-    try { showToast(`Moved ${srcName} from ${srcDayLabel} to ${dstDayLabel}`, 3000); } catch(_) {}
+    try { showToast(_moveToastText(data, srcName, dstName, srcDayLabel, dstDayLabel), 3000); } catch(_) {}
     await loadPlan();
     try { await loadCalendar(); } catch(_) {}
   } catch(err) {
@@ -14848,6 +14852,28 @@ function calDragEnd(e) {
   window._calDrag = null;
 }
 
+// #27: a drop on another training day swaps the two sessions; the toast says
+// where each one went. Not "Swap": that names the re-draw button and the
+// swap-type pin. {B} comes from the view's own lookup, else from the server.
+// W11: a refused or failed drop (no ok:true) is worded here too, so both views
+// say the same thing and a structured 422 code never reaches the rider.
+function _moveToastText(data, srcName, dstName, srcDayLabel, dstDayLabel) {
+  if (!data || data.ok !== true) {
+    const err = data && data.error;
+    if (err === 'source_session_not_found') return "Couldn't find that session. Try refreshing.";
+    if (err === 'target_week_not_found') return 'That day is outside your plan.';
+    return err ? `Move failed: ${err}` : 'Move failed.';
+  }
+  const sw = data.swapped;
+  if (sw) {
+    const other = dstName || sw.zwo_name || String(sw.session_type || '').toUpperCase() || 'session';
+    // W12: a skipped session stays skipped where it lands (nothing is sent to
+    // the watch for it), so don't make it sound like it is back on.
+    if (sw.status === 'dismissed') return `Moved ${srcName} to ${dstDayLabel}; ${other} (skipped) is now on ${srcDayLabel}`;
+    return `Moved ${srcName} to ${dstDayLabel} and ${other} to ${srcDayLabel}`;
+  }
+  return `Moved ${srcName} from ${srcDayLabel} to ${dstDayLabel}`;
+}
 async function calDrop(e, dstDay, dstWeekIdx) {
   e.preventDefault();
   e.stopPropagation();
@@ -14863,6 +14889,7 @@ async function calDrop(e, dstDay, dstWeekIdx) {
 
   // Resolve a friendly source-workout name + day labels for the toast.
   let srcName = 'session';
+  let dstName = '';
   let srcDayLabel = srcDay;
   let dstDayLabel = dstDay;
   try {
@@ -14874,6 +14901,10 @@ async function calDrop(e, dstDay, dstWeekIdx) {
             srcName = dd.planned.name
               || (dd.planned.content_class || dd.planned.session_type || '').toUpperCase()
               || 'session';
+          }
+          if (dd.date === dstDay && dd.planned) {
+            dstName = dd.planned.name
+              || (dd.planned.content_class || dd.planned.session_type || '').toUpperCase();
           }
         }
       }
@@ -14890,16 +14921,13 @@ async function calDrop(e, dstDay, dstWeekIdx) {
     });
     let data = {};
     try { data = await res.json(); } catch(_) {}
-    if (!res.ok || data.ok === false) {
-      // v4.3.0 B1: friendly toast for the structured 422 source-not-found.
-      if (res.status === 422 && data && data.error === 'source_session_not_found') {
-        try { showToast("Couldn't find that session. Try refreshing.", 3500); } catch(_) {}
-      } else {
-        try { showToast('Move failed.', 3000); } catch(_) {}
-      }
+    if (!res.ok || !data.ok) {
+      // v4.3.0 B1 / #27 W11: the structured 422 codes read as a sentence, a
+      // refused drop (409) shows its own sentence.
+      try { showToast(_moveToastText(data, srcName, dstName, srcDayLabel, dstDayLabel), 3500); } catch(_) {}
       return;
     }
-    try { showToast(`Moved ${srcName} from ${srcDayLabel} to ${dstDayLabel}`, 3000); } catch(_) {}
+    try { showToast(_moveToastText(data, srcName, dstName, srcDayLabel, dstDayLabel), 3000); } catch(_) {}
     // Re-fetch + re-render the calendar (don't yank viewport).
     window._calDidAutoScroll = true;
     await loadCalendar();
@@ -16597,6 +16625,11 @@ function icuPushToastFromResult(r, verb) {
     showToast('HR-mode push needs a valid LTHR (below max HR) — set it in Settings first.', 7000, 'warning');
     return;
   }
+  if (r.error === 'busy') {
+    // #28: another calendar update held the lock — nothing failed.
+    showToast('A calendar update is already running — try again in a moment.', 6000, 'warning');
+    return;
+  }
   if (r.error) {
     showToast("Couldn't reach intervals.icu — nothing was changed. Try again in a moment.", 6000, 'error');
     return;
@@ -16608,6 +16641,9 @@ function icuPushToastFromResult(r, verb) {
   let msg = parts.length ? (verb + ': ' + parts.join(' · ')) : (verb + ': calendar already up to date');
   const nSkip = (r.skipped || []).length;
   if (nSkip) msg += ' · ' + nSkip + ' skipped';
+  // #28: workouts the rider moved in intervals.icu are left there on purpose.
+  if (r.held === 1) msg += ' · 1 workout kept where you moved it in intervals.icu';
+  else if (r.held > 1) msg += ' · ' + r.held + ' workouts kept where you moved them in intervals.icu';
   showToast(msg, 5000, 'success');
 }
 

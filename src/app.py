@@ -7794,7 +7794,7 @@ def _icu_push_sync_enabled() -> bool:
         return False
 
 
-def _icu_push_debounced_run(expected_pid: str) -> None:
+def _icu_push_debounced_run(expected_pid: str, retried: bool = False) -> None:
     global _icu_push_timer
     with _icu_push_timer_lock:
         _icu_push_timer = None
@@ -7822,6 +7822,18 @@ def _icu_push_debounced_run(expected_pid: str) -> None:
                   res.get("pushed"), res.get("updated"), res.get("deleted"),
                   res.get("needs_reconnect"), res.get("error"),
                   res.get("error_detail"))
+        # #28 W16: "busy" = another reconcile held the calendar lock past
+        # the wait, so the plan write this run was armed for never reached
+        # intervals.icu, and the next trigger can be tomorrow's daily run.
+        # Re-arm once; a timer a newer plan write armed meanwhile covers it.
+        if res.get("error") == "busy" and not retried:
+            with _icu_push_timer_lock:
+                if _icu_push_timer is None:
+                    t = threading.Timer(ICU_PUSH_DEBOUNCE_S, _icu_push_debounced_run,
+                                        args=(expected_pid, True))
+                    t.daemon = True
+                    _icu_push_timer = t
+                    t.start()
     except Exception:
         _log.warning("debounced ICU calendar push failed", exc_info=True)
 
@@ -7997,6 +8009,10 @@ def api_calendar_push_workout(body: "dict | None" = None):
         client index or a hand-rolled <n> (grill amendment 2). O1: the horizon is
         extended to cover a target day beyond the 14-day auto-sync window.
 
+    #28: a planned session the rider moved in intervals.icu is not pushed —
+    {ok, pushed: 0, kept_on: <the day it is on there>} — and the planner push
+    waits for a running reconcile ({error: "busy"} after a minute).
+
     ALWAYS HTTP 200 with a data dict ({ok,pushed,event_date} / {needs_reconnect}
     / {needs_lthr} / {error}) — never a 4xx/500, so the shared toast handler reads
     the fields (amendment 7; mirrors api_icu_push). Guard chain mirrors reconcile
@@ -8050,6 +8066,23 @@ def api_calendar_push_workout(body: "dict | None" = None):
             return {"error": "date_out_of_range"}
         date_iso = target.isoformat()
 
+        def _send(events):
+            # ONE bulk upsert (idempotent on external_id) via the engine's own
+            # seam — the SAME transport reconcile uses, so 403-scope maps to
+            # needs_reconnect.
+            status, resp = _icp._http(
+                "POST", f"athlete/{athlete_id}/events/bulk?upsert=true",
+                payload=events)
+            if _icp._scope_403(status, resp):
+                return {"needs_reconnect": True}
+            if status == 0:
+                return {"error": "network"}
+            if not (200 <= status < 300):
+                return {"error": f"http_{status}"}
+            _log.info("EVENT=icu_calendar_push_workout source=%s date=%s pushed=1",
+                      source, date_iso)
+            return {"ok": True, "pushed": 1, "event_date": date_iso}
+
         workout_dir = Path(active_workout_dir())
         if source == "library":
             # amendment 5: zwo_file is CLIENT-supplied → reject traversal BEFORE
@@ -8074,8 +8107,11 @@ def api_calendar_push_workout(body: "dict | None" = None):
                 hr_mode, lthr_ok)
             if event is None:
                 return {"error": reason}
-            events = [event]
-        else:  # planner
+            return _send([event])
+
+        def _push_planned():
+            # #28: read the plan, the window and push under the reconcile
+            # lock, so a reconcile this waited for is seen whole.
             plan = _icp._load_plan()
             if plan is None:
                 return {"error": "no_plan"}
@@ -8103,22 +8139,23 @@ def api_calendar_push_workout(body: "dict | None" = None):
                 if reason == "needs_lthr":
                     return {"needs_lthr": True}
                 return {"error": "not a pushable planned session"}
-            events = [event]
+            # #28: the upsert is keyed by external_id, which a drag in the
+            # intervals.icu calendar keeps — pushing blindly pulled a workout
+            # the rider moved there back to its planned day. Read the window
+            # first and leave it where they put it.
+            kept_on, err_res = _icp.moved_copy_day(
+                athlete_id, plan, event["external_id"], profile_id, horizon)
+            if err_res is not None:
+                if err_res.get("needs_reconnect"):
+                    return {"needs_reconnect": True}
+                return {"error": err_res.get("error") or "network"}
+            if kept_on is not None:
+                _log.info("EVENT=icu_calendar_push_workout source=planner "
+                          "date=%s pushed=0 kept_on=%s", date_iso, kept_on)
+                return {"ok": True, "pushed": 0, "kept_on": kept_on}
+            return _send([event])
 
-        # ONE bulk upsert (idempotent on external_id) via the engine's own seam —
-        # the SAME transport reconcile uses, so 403-scope maps to needs_reconnect.
-        status, resp = _icp._http(
-            "POST", f"athlete/{athlete_id}/events/bulk?upsert=true",
-            payload=events)
-        if _icp._scope_403(status, resp):
-            return {"needs_reconnect": True}
-        if status == 0:
-            return {"error": "network"}
-        if not (200 <= status < 300):
-            return {"error": f"http_{status}"}
-        _log.info("EVENT=icu_calendar_push_workout source=%s date=%s pushed=1",
-                  source, date_iso)
-        return {"ok": True, "pushed": 1, "event_date": date_iso}
+        return _icp._one_at_a_time(_icp._RECONCILE_LOCK_TIMEOUT_S, _push_planned)
     except Exception as e:                      # amendment 7: zero 500s, ever
         _log.exception("calendar push-workout endpoint failed")
         return {"error": f"internal:{type(e).__name__}"}
@@ -13350,6 +13387,19 @@ def _apply_move_session(
 
     FC3 (v2.5.0, L3-2/L3-10): a race entry is never moved, and nothing is ever
     moved ONTO a race day — returns None (the endpoint 400s before calling).
+
+    #27: a rider's move (``auto=False``) never destroys a session. Dropped on
+    a day that holds one training session (pending, missed or dismissed), the
+    two trade places: the displaced session lands on ``src_iso`` under the
+    same landing rule as the dragged one (both pinned ``user_moved``, each
+    ``moved_from`` the day it left) and no rest stub is written. A rest day,
+    a ``moved_from:`` stub or an empty day is taken as before. A rider's move
+    is refused (None, plan untouched) when either day was ridden (status
+    done / done_partial / ambiguous) or holds more than one row in its
+    stored week, or when the source is a rest day or a ``moved_from:`` stub
+    rather than a session. ``auto=True`` keeps the overwrite: the auto-reschedule
+    takeover writes off the easy day by design and its undo relies on the
+    stub.
     """
     try:
         src_d = date.fromisoformat(src_iso)
@@ -13383,36 +13433,77 @@ def _apply_move_session(
     dst_week = weeks_data[dst_week_idx]
     src_sessions = src_week.get("sessions", [])
     dst_sessions = dst_week.get("sessions", [])
-    src_session = next((s for s in src_sessions if s.get("day") == src_iso), None)
+    src_here = [s for s in src_sessions if s.get("day") == src_iso]
+    dst_here = [s for s in dst_sessions if s.get("day") == dst_iso]
+    src_session = src_here[0] if src_here else None
     if not src_session:
         return None
-    dst_session = next((s for s in dst_sessions if s.get("day") == dst_iso), None)
+    dst_session = dst_here[0] if dst_here else None
 
     # FC3 (v2.5.0): the race entry is immutable — not movable, not overwritable.
     if src_session.get("is_race") or (dst_session or {}).get("is_race"):
         return None
 
-    moved_payload = {k: v for k, v in src_session.items()}
-    moved_payload["day"] = dst_iso
-    moved_payload["day_name"] = (
-        dst_session["day_name"] if dst_session else dst_d.strftime("%a")
+    if not auto:
+        # #27: a ridden session stays on the day it was ridden (a swap would
+        # carry its ride credit to a day it was not ridden), and a day with
+        # two rows would lose one half or hold two copies of the dragged one.
+        if any(str((s or {}).get("status") or "") in _RIDDEN_RANK
+               for s in (src_session, dst_session)):
+            return None
+        if len(src_here) > 1 or len(dst_here) > 1:
+            return None
+        # #27 W14: a rider drags a session, never a rest day or the stub a
+        # move left. Swapped onto a training day, a stub would carry its
+        # "moved_from:" pointer to a day it does not describe, and the
+        # calendar push follows that pointer (#28). The views never drag
+        # either; a stale client or the raw API can.
+        if ((src_session.get("session_type") or "") == "rest"
+                or str(src_session.get("status") or "").startswith("moved_from:")):
+            return None
+
+    def _landed(sess: dict, day_iso: str, day_name: str, from_iso: str) -> dict:
+        out = {k: v for k, v in sess.items()}
+        out["day"] = day_iso
+        out["day_name"] = day_name
+        if auto:
+            # FC5a: auto-relocations carry their own provenance and never the
+            # user pin (a prior user_moved on the source is superseded — the
+            # session no longer sits where the user put it).
+            out["user_moved"] = False
+            out["auto_moved"] = True
+        else:
+            out["user_moved"] = True
+            out["auto_moved"] = False
+        out["moved_from"] = from_iso
+        if out.get("status", "pending") == "pending":
+            out["status"] = "pending"
+        elif out.get("status") == "missed" and date.fromisoformat(day_iso) >= clock.today():
+            # Dragged onto a day still to come: owed there, not missed; left
+            # "missed", the auto-reschedule moved it off the day it was put on.
+            out["status"] = "pending"
+        return out
+
+    moved_payload = _landed(
+        src_session, dst_iso,
+        dst_session["day_name"] if dst_session else dst_d.strftime("%a"),
+        src_iso,
     )
-    if auto:
-        # FC5a: auto-relocations carry their own provenance and never the
-        # user pin (a prior user_moved on the source is superseded — the
-        # session no longer sits where the user put it).
-        moved_payload["user_moved"] = False
-        moved_payload["auto_moved"] = True
-    else:
-        moved_payload["user_moved"] = True
-        moved_payload["auto_moved"] = False
-    moved_payload["moved_from"] = src_iso
-    if reset_status_to_pending or moved_payload.get("status", "pending") == "pending":
+    if reset_status_to_pending:
         moved_payload["status"] = "pending"
-    elif moved_payload.get("status") == "missed" and dst_d >= clock.today():
-        # Dragged onto a day still to come: owed there, not missed; left
-        # "missed", the auto-reschedule moved it off the day it was put on.
-        moved_payload["status"] = "pending"
+
+    # #27: a rider's drop onto a training day swaps the two. Both sessions
+    # land by the same rule, so both are pinned where the rider put them (a
+    # refit must not rewrite the half it did not see dragged).
+    displaced = None
+    if (not auto and dst_session is not None
+            and (dst_session.get("session_type") or "") != "rest"
+            and not str(dst_session.get("status") or "").startswith("moved_from:")):
+        displaced = _landed(
+            dst_session, src_iso,
+            src_session.get("day_name") or src_d.strftime("%a"),
+            dst_iso,
+        )
     if auto:
         # What the move changed, so a ride that turns up later on the
         # session's own day can undo it (_undo_auto_moves_for_ridden_days):
@@ -13438,7 +13529,9 @@ def _apply_move_session(
 
     new_src = []
     for s in src_sessions:
-        if s.get("day") == src_iso:
+        if s.get("day") == src_iso and displaced is not None:
+            new_src.append(displaced)
+        elif s.get("day") == src_iso:
             new_src.append({
                 "day": src_iso, "day_name": src_session["day_name"],
                 "session_type": "rest", "duration_min": 0,
@@ -13868,8 +13961,18 @@ async def api_plan_move_session(request: Request):
 
     - Sets `user_moved=True` on the session at its new slot.
     - Records `moved_from=<original iso date>`.
-    - The vacated slot becomes a rest with `status=moved_from:<new_date>`.
+    - Onto a rest day, a `moved_from:` stub or an empty day: the vacated slot
+      becomes a rest with `status=moved_from:<new_date>`.
+    - #27: onto a day holding one training session, the two swap places
+      (both pinned `user_moved`, each `moved_from` the day it left) and
+      nothing is vacated. A ridden day or a day with two sessions is refused
+      with 409 and a plain sentence in `error`; the plan is not written.
+      A rest day or a `moved_from:` stub is not a session to move: 422
+      `source_session_not_found`, as for an empty day.
     - §6.12: regenerate_from_today honors user_moved=True — never re-prescribed.
+
+    Returns `{"ok": true, "moved": <session now on new_date>,
+    "vacated": <date> | null, "swapped": <session now on date> | null}`.
     """
     body = await _get_json_body(request)
     json_path = _plan_dir() / "current_plan.json"
@@ -13888,113 +13991,154 @@ async def api_plan_move_session(request: Request):
     if src_iso == dst_iso:
         return JSONResponse({"error": "date and new_date must differ"}, 400)
 
-    try:
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
+    def _move_under_plan_lock():
+        # #27: read -> mutate -> write under the plan-write lock the ride
+        # sync holds (rematch pattern): a swap rewrites two days, and a
+        # sync's read-modify-write in between would revert one of them.
+        # W15: this runs on a worker thread (below). A background adapt can
+        # hold the lock for a whole plan update; waiting for it on the event
+        # loop would stall every other request until then.
+        with tp.plan_write_lock():
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
 
-        # v4.1.1 FIX-PICKER-MOVE (Bug E): week-boundary check now uses ISO
-        # Mon-Sun — NOT the iterate-stored-weeks approach. The old check
-        # required BOTH src and dst to be inside the same stored week,
-        # but stored weeks in current_plan.json may use legacy Fri-Thu
-        # boundaries (or Sat-Fri on older plans), while the dashboard
-        # UI renders the week as Mon-Sun (src/week_view.py).
-        # That meant Tue 04-21 → Fri 04-24 (same ISO week 17) was
-        # rejected because they sat in adjacent stored Fri-Thu slices.
-        # Root cause: comparison axis mismatch between UI (ISO) and
-        # handler (stored).  We now validate on ISO week and let the
-        # writer below thread each date into whichever stored week
-        # actually contains it.
-        src_d = date.fromisoformat(src_iso)
-        dst_d = date.fromisoformat(dst_iso)
-        src_iso_week = src_d.isocalendar()[:2]  # (iso_year, iso_week)
-        dst_iso_week = dst_d.isocalendar()[:2]
-        if src_iso_week != dst_iso_week:
-            return JSONResponse(
-                {"error": "move must stay within the current ISO week (Mon-Sun)"},
-                400,
-            )
-        # A day that has passed is a record of what was ridden, not a slot: a
-        # session dropped there would be "missed" the moment it lands, and the
-        # day it left becomes a rest stub. Moving a missed session FORWARD
-        # (a past source) stays allowed.
-        if dst_d < clock.today():
-            return JSONResponse(
-                {"error": "cannot move a session onto a day that has passed",
-                 "date": dst_iso}, 400)
+            # v4.1.1 FIX-PICKER-MOVE (Bug E): week-boundary check now uses ISO
+            # Mon-Sun — NOT the iterate-stored-weeks approach. The old check
+            # required BOTH src and dst to be inside the same stored week,
+            # but stored weeks in current_plan.json may use legacy Fri-Thu
+            # boundaries (or Sat-Fri on older plans), while the dashboard
+            # UI renders the week as Mon-Sun (src/week_view.py).
+            # That meant Tue 04-21 → Fri 04-24 (same ISO week 17) was
+            # rejected because they sat in adjacent stored Fri-Thu slices.
+            # Root cause: comparison axis mismatch between UI (ISO) and
+            # handler (stored).  We now validate on ISO week and let the
+            # writer below thread each date into whichever stored week
+            # actually contains it.
+            src_d = date.fromisoformat(src_iso)
+            dst_d = date.fromisoformat(dst_iso)
+            src_iso_week = src_d.isocalendar()[:2]  # (iso_year, iso_week)
+            dst_iso_week = dst_d.isocalendar()[:2]
+            if src_iso_week != dst_iso_week:
+                return JSONResponse(
+                    {"error": "move must stay within the current ISO week (Mon-Sun)"},
+                    400,
+                )
+            # A day that has passed is a record of what was ridden, not a slot: a
+            # session dropped there would be "missed" the moment it lands, and the
+            # day it left becomes a rest stub. Moving a missed session FORWARD
+            # (a past source) stays allowed.
+            if dst_d < clock.today():
+                return JSONResponse(
+                    {"error": "cannot move a session onto a day that has passed",
+                     "date": dst_iso}, 400)
 
-        weeks_data = plan.get("weeks", [])
+            weeks_data = plan.get("weeks", [])
 
-        def _find_week_idx(target: date) -> int | None:
-            for i, w in enumerate(weeks_data):
+            def _find_week_idx(target: date) -> int | None:
+                for i, w in enumerate(weeks_data):
+                    try:
+                        w_start = date.fromisoformat(w["start"])
+                        w_end = date.fromisoformat(w["end"])
+                    except (KeyError, ValueError):
+                        continue
+                    if w_start <= target <= w_end:
+                        return i
+                return None
+
+            src_week_idx = _find_week_idx(src_d)
+            dst_week_idx = _find_week_idx(dst_d)
+
+            # v4.3.0 B1 — Lazy-load + 422 fix.
+            # Symptom: user dragged a session within the visible Mon-Sun week and
+            # got a cryptic "no stored week contains source date" toast.
+            # Root cause: ``plan["weeks"]`` may have been written by a stale planner
+            # whose week boundaries don't cover the source date (legacy Sat-Fri vs
+            # the new Mon-Sun grid the UI shows). When that happens we re-read the
+            # plan straight from disk (a sibling process or a recent regen may have
+            # written newer weeks) and retry. If that STILL fails we return 422
+            # with a structured error code so the UI can show a clean toast
+            # ("Couldn't find that session. Try refreshing.") instead of the raw
+            # 404 string.
+            if src_week_idx is None or dst_week_idx is None:
                 try:
-                    w_start = date.fromisoformat(w["start"])
-                    w_end = date.fromisoformat(w["end"])
-                except (KeyError, ValueError):
-                    continue
-                if w_start <= target <= w_end:
-                    return i
-            return None
+                    with open(json_path, encoding="utf-8") as f:
+                        plan_disk = json.load(f)
+                    weeks_data = plan_disk.get("weeks", [])
+                    src_week_idx = _find_week_idx(src_d)
+                    dst_week_idx = _find_week_idx(dst_d)
+                    if src_week_idx is not None or dst_week_idx is not None:
+                        # Lazy-load found something — swap the in-memory plan to
+                        # the disk version so all downstream writes see it.
+                        plan = plan_disk
+                except (OSError, json.JSONDecodeError) as _e:
+                    _log.debug(f"move-session lazy-reload failed: {_e}")
 
-        src_week_idx = _find_week_idx(src_d)
-        dst_week_idx = _find_week_idx(dst_d)
+            if src_week_idx is None:
+                return JSONResponse(
+                    {"error": "source_session_not_found", "date": src_iso}, 422
+                )
+            if dst_week_idx is None:
+                return JSONResponse(
+                    {"error": "target_week_not_found", "date": dst_iso}, 422
+                )
 
-        # v4.3.0 B1 — Lazy-load + 422 fix.
-        # Symptom: user dragged a session within the visible Mon-Sun week and
-        # got a cryptic "no stored week contains source date" toast.
-        # Root cause: ``plan["weeks"]`` may have been written by a stale planner
-        # whose week boundaries don't cover the source date (legacy Sat-Fri vs
-        # the new Mon-Sun grid the UI shows). When that happens we re-read the
-        # plan straight from disk (a sibling process or a recent regen may have
-        # written newer weeks) and retry. If that STILL fails we return 422
-        # with a structured error code so the UI can show a clean toast
-        # ("Couldn't find that session. Try refreshing.") instead of the raw
-        # 404 string.
-        if src_week_idx is None or dst_week_idx is None:
-            try:
-                with open(json_path, encoding="utf-8") as f:
-                    plan_disk = json.load(f)
-                weeks_data = plan_disk.get("weeks", [])
-                src_week_idx = _find_week_idx(src_d)
-                dst_week_idx = _find_week_idx(dst_d)
-                if src_week_idx is not None or dst_week_idx is not None:
-                    # Lazy-load found something — swap the in-memory plan to
-                    # the disk version so all downstream writes see it.
-                    plan = plan_disk
-            except (OSError, json.JSONDecodeError) as _e:
-                _log.debug(f"move-session lazy-reload failed: {_e}")
+            # FC3 (v2.5.0, L3-2/L3-10): the race entry is goal-owned — a drag must
+            # not move it, and nothing may be dropped ONTO it. The sanctioned write
+            # path for the race is the goal-level add/edit-race flow.
+            for w in plan.get("weeks", []) or []:
+                for s in w.get("sessions", []) or []:
+                    if s.get("day") in (src_iso, dst_iso) and s.get("is_race"):
+                        return JSONResponse(
+                            {"error": "race day is fixed — edit the race instead"},
+                            400,
+                        )
 
-        if src_week_idx is None:
-            return JSONResponse(
-                {"error": "source_session_not_found", "date": src_iso}, 422
-            )
-        if dst_week_idx is None:
-            return JSONResponse(
-                {"error": "target_week_not_found", "date": dst_iso}, 422
-            )
+            # #27: the mutator refuses these too (None); checked here first so
+            # the rider reads why. The drop predicates block most of them, but
+            # a stale view can still send one, and the plan grid lets today's
+            # partly ridden session be dragged.
+            src_rows = [s for s in weeks_data[src_week_idx].get("sessions", []) or []
+                        if s.get("day") == src_iso]
+            dst_rows = [s for s in weeks_data[dst_week_idx].get("sessions", []) or []
+                        if s.get("day") == dst_iso]
+            if len(src_rows) > 1 or len(dst_rows) > 1:
+                return JSONResponse(
+                    {"error": "Days with two sessions can't be changed by "
+                              "dragging yet."},
+                    409,
+                )
+            if any(str(s.get("status") or "") in _RIDDEN_RANK
+                   for s in src_rows + dst_rows):
+                return JSONResponse(
+                    {"error": "That day has already been ridden."}, 409
+                )
 
-        # FC3 (v2.5.0, L3-2/L3-10): the race entry is goal-owned — a drag must
-        # not move it, and nothing may be dropped ONTO it. The sanctioned write
-        # path for the race is the goal-level add/edit-race flow.
-        for w in plan.get("weeks", []) or []:
-            for s in w.get("sessions", []) or []:
-                if s.get("day") in (src_iso, dst_iso) and s.get("is_race"):
-                    return JSONResponse(
-                        {"error": "race day is fixed — edit the race instead"},
-                        400,
-                    )
+            # Mutation is shared with the auto-reschedule path (_apply_move_session):
+            # one same-week relocation. A rider's drop onto a training day swaps
+            # (#27); the auto path keeps its overwrite + rest stub.
+            moved_payload = _apply_move_session(plan, src_iso, dst_iso)
+            if moved_payload is None:
+                return JSONResponse(
+                    {"error": "source_session_not_found", "date": src_iso}, 422
+                )
 
-        # Mutation is shared with the auto-reschedule path (_apply_move_session)
-        # so both apply the identical same-week relocation + rest-stub rewrite.
-        moved_payload = _apply_move_session(plan, src_iso, dst_iso)
-        if moved_payload is None:
-            return JSONResponse(
-                {"error": "source_session_not_found", "date": src_iso}, 422
-            )
+            tp.atomic_write_plan(json_path, plan)
 
-        tp.atomic_write_plan(json_path, plan)
+            # #27: a stub left on the source day means a move; the displaced
+            # session sitting there means a swap and nothing was vacated.
+            at_src = next((s for s in weeks_data[src_week_idx].get("sessions", []) or []
+                           if s.get("day") == src_iso), None)
+            if at_src is None or str(at_src.get("status") or "").startswith("moved_from:"):
+                vacated, swapped = src_iso, None
+            else:
+                vacated, swapped = None, at_src
 
-        return {"ok": True, "moved": moved_payload, "vacated": src_iso}
+        return {"ok": True, "moved": moved_payload, "vacated": vacated,
+                "swapped": swapped}
 
+    try:
+        from starlette.concurrency import run_in_threadpool
+        return await run_in_threadpool(_move_under_plan_lock)
     except Exception:
         _log.exception("Plan move-session failed")
         return JSONResponse({"detail": "Move failed"}, 500)
