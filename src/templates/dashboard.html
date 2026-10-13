@@ -3298,6 +3298,7 @@ window.addEventListener('unhandledrejection', function(e) {
           <input type="checkbox" id="icu-cal-sync-toggle" onchange="icuCalSyncToggle(this)">
           <span>Keep intervals.icu calendar in sync</span>
         </label>
+        <div id="icu-cal-sync-held" style="display:none;font-size:12px;color:var(--text2);margin-top:6px;"></div>
         <div id="icu-cal-sync-hint" style="font-size:11px;color:var(--text3);margin-top:4px;">
           Mirrors your next 14 days of planned workouts to your intervals.icu
           calendar after every plan change (Garmin &amp; MyWhoosh pull workouts
@@ -13124,6 +13125,7 @@ async function renderPlanJSON(plan) {
           display_name: s.display_name || '', zwo_name: s.zwo_name || '',
           name: s.zwo_name || s.description || '',
           duration_min: s.duration_min, tss: s.tss_estimate,
+          user_moved: !!s.user_moved,
         }, cardState);
 
         // Mini power block SVG. v4.1.1 FIX-PLANNER B: prefer the
@@ -13740,7 +13742,13 @@ function plannedCardParts(planned, cardState) {
   const title = calCardTitleWithStructure(planned);
   const cssCls = calContentCss(planned.content_class, planned.session_type);
   const dur = planned.duration_min ? `${Math.round(planned.duration_min)}m` : '';
-  const metaText = `${dur}${planned.tss ? ' · ' + Math.round(planned.tss) + ' TSS' : ''}`;
+  // #34: say on the card that the rider moved it. Since #27 a moved session
+  // keeps its length when that day's hours change, so the rider needs to see
+  // why; Home's This-week card already showed "moved", the Plan tab did not.
+  const moved = planned.user_moved
+    ? ' · <span class="card-moved" title="You moved this workout. It keeps its length when that day\'s hours change.">moved</span>'
+    : '';
+  const metaText = `${dur}${planned.tss ? ' · ' + Math.round(planned.tss) + ' TSS' : ''}${moved}`;
   const warn = cardState === 'missing_workout'
     ? '<span class="cal-planned-warn" title="Workout missing — click ⟳ to assign one.">⚠</span>'
     : '';
@@ -16674,6 +16682,16 @@ async function icuCalSyncRefresh() {
     cb.disabled = !s.write_ok && !s.sync_enabled;
     if (hint && !s.write_ok) {
       hint.innerHTML = 'Reconnect intervals.icu (button above) to grant calendar permission, then enable sync.';
+    }
+    // #34: automatic pushes are silent, so riders with sync on never saw the
+    // workouts Domestique left where they moved them in intervals.icu (#28).
+    const held = $('icu-cal-sync-held');
+    if (held) {
+      const n = (s.sync_enabled && s.last_result && s.last_result.held) || 0;
+      held.textContent = n === 1
+        ? 'Last update: 1 workout kept where you moved it in intervals.icu. Domestique still shows it on its planned day.'
+        : `Last update: ${n} workouts kept where you moved them in intervals.icu. Domestique still shows them on their planned days.`;
+      held.style.display = n > 0 ? 'block' : 'none';
     }
   } catch (_) { blk.style.display = 'none'; }
 }
