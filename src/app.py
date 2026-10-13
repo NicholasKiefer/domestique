@@ -1808,9 +1808,9 @@ def api_profile_ftp_history():
         # Derive the canonical "type" from source if populated (catches
         # eftp_auto / eftp_icu / tested_* enums), else fall back to method.
         if src in ("eftp_auto", "eftp_icu", "eftp_local",
-                   "tested_coggan_20min", "tested_ramp"):
+                   "tested_coggan_20min", "tested_ramp", "tested_cp_test"):
             row_type = src
-        elif method in ("coggan_20min", "ramp"):
+        elif method in ("coggan_20min", "ramp", "cp_test"):
             row_type = f"tested_{method}"
         else:
             row_type = "manual"
@@ -1850,6 +1850,7 @@ def api_profile_update_ftp(body: dict):
     source_map = {
         "coggan_20min": "tested_coggan_20min",
         "ramp": "tested_ramp",
+        "cp_test": "tested_cp_test",
         "manual": "manual",
     }
     ftp_source_tag = source_map.get(method, "manual")
@@ -16714,6 +16715,8 @@ def _ftp_test_family(fname: str) -> "str | None":
         return "coggan_20min"
     if f.startswith("ftp_test_60min"):
         return "sixty_min"
+    if f.startswith("ftp_test_cp"):
+        return "cp_test"
     return None
 
 
@@ -16731,6 +16734,7 @@ _FTP_TEST_PREFERRED_FILE = {
     "ramp": ("ftp_test_ramp_ladder21_200pct_35min.zwo", 35, 60),
     "coggan_20min": ("ftp_test_coggan_3x1min-1min_95pct_59min.zwo", 59, 75),
     "sixty_min": ("ftp_test_60min_steady_86min.zwo", 86, 100),
+    "cp_test": ("ftp_test_cp_12-7-3min_100pct_110min.zwo", 110, 85),
 }
 
 
@@ -16742,9 +16746,9 @@ async def api_plan_ftp_test_type(request: Request):
     body = await _get_json_body(request)
     day_iso = str(body.get("date") or "").strip()
     test_type = str(body.get("test_type") or "").strip()
-    if test_type not in ("ramp", "coggan_20min", "sixty_min"):
+    if test_type not in _FTP_TEST_PREFERRED_FILE:
         return JSONResponse(
-            {"error": "test_type must be ramp, coggan_20min or sixty_min"}, 400)
+            {"error": "test_type must be ramp, coggan_20min, sixty_min or cp_test"}, 400)
     try:
         date.fromisoformat(day_iso)
     except ValueError:
@@ -19632,7 +19636,8 @@ def api_ride_ftp_test_analysis(ride_id: str):
     if ws is not None and we is not None:
         label = {"coggan_20min": "20-min block (scored)",
                  "ramp": "best sustained minute (scored)",
-                 "sixty_min": "hour plateau (scored)"}.get(kind, "scored window")
+                 "sixty_min": "hour plateau (scored)",
+                 "cp_test": "12-min effort (with the 7 and 3)"}.get(kind, "scored window")
         windows.append({"kind": "scored", "start_s": int(ws), "end_s": int(we), "label": label})
     if suggestion.get("blowout_start_s") is not None:
         windows.append({"kind": "blowout", "start_s": int(suggestion["blowout_start_s"]),

@@ -94,7 +94,7 @@ _FACTS = {
     # What the rider typed or rode outranks what a machine estimated.
     # "eftp_auto" is the sustained-drift rule applying an estimate unasked.
     "ftp": _Fact("ftp", "ftp_source", "W", 50, 600, {
-        "manual": 2, "tested_coggan_20min": 2, "tested_ramp": 2,
+        "manual": 2, "tested_coggan_20min": 2, "tested_ramp": 2, "tested_cp_test": 2,
         "eftp_icu": 1, "eftp_auto": 1, "eftp_local": 1}),
     "wprime": _Fact("wprime_j", "wprime_source", "J", 5000, 40000, {
         "manual": 3, "icu": 2, "monod": 1, "fallback": 0}),

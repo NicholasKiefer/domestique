@@ -8534,7 +8534,8 @@ function showFtpTestModal(suggestion, opts) {
   const deltaColor = delta >= 0 ? '#22c55e' : '#ef4444';
   const methodLabel = fs.method === 'ramp' ? 'Ramp'
     : fs.method === 'coggan_20min' ? 'Coggan 20-min'
-    : fs.method === 'sixty_min' ? '60-min hour of power' : (fs.method || 'Unknown');
+    : fs.method === 'sixty_min' ? '60-min hour of power'
+    : fs.method === 'cp_test' ? 'Critical Power 12/7/3' : (fs.method || 'Unknown');
   let html = `<h2 style="margin-top:0;">FTP Test Detected</h2>`;
   html += `<div style="font-size:12px;color:var(--text2);letter-spacing:0.5px;font-weight:600;margin-bottom:8px;">METHOD: ${esc(methodLabel)}</div>`;
   html += `<div style="font-size:24px;font-weight:900;margin-bottom:6px;">Suggested new FTP: <span style="color:var(--accent);">${fs.ftp}</span> W</div>`;
@@ -8543,6 +8544,10 @@ function showFtpTestModal(suggestion, opts) {
   // 60-min early-quit fallback, pacing drift, Sitko level band.
   if (fs.fallback_from === 'sixty_min') {
     html += `<div style="background:rgba(234,179,8,0.10);border:1px solid #eab308;color:#a16207;padding:8px 12px;border-radius:6px;font-size:12px;margin-bottom:12px;">The hour wasn't completed (sustained effort &lt; 50 min), so this number was scored with the validated 20-min method instead of a blind 60-min average.</div>`;
+  }
+  if (fs.method === 'cp_test' && fs.efforts_w) {
+    // W' from trials 30 min apart is not reliable (Karsten 2017): information only.
+    html += `<div style="font-size:12px;color:var(--text2);margin-bottom:10px;">Efforts: 12 min ${esc(String(fs.efforts_w['12min']))} W · 7 min ${esc(String(fs.efforts_w['7min']))} W · 3 min ${esc(String(fs.efforts_w['3min']))} W. Your FTP is set to your critical power. W′ ${esc(String(Math.round((fs.w_prime_j || 0) / 100) / 10))} kJ, for information only: rests of 30 minutes measure it poorly.</div>`;
   }
   if (fs.pacing_drift) {
     html += `<div style="font-size:12px;color:var(--text2);margin-bottom:10px;">&#9888; Pacing drift ${esc(String(fs.pacing_drift_pct))}% between halves — an evenly paced test reads truer.</div>`;
@@ -8588,10 +8593,11 @@ async function renderFtpTestAnalysis(rideId, fs) {
   } catch (_) { host.innerHTML = ''; return; }
   const sug = a.suggestion || fs || {};
   const method = sug.method || sug.type || '';
-  const isRamp = method === 'ramp', isHour = method === 'sixty_min';
-  const factor = sug.factor != null ? sug.factor : (isRamp ? 0.75 : isHour ? 1.0 : 0.95);
-  const base = isRamp ? sug.best_60s : isHour ? sug.best_60min : sug.best_20min;
-  const baseLabel = isRamp ? 'best sustained minute' : isHour ? 'hour plateau mean' : 'best 20-min mean';
+  const isRamp = method === 'ramp', isHour = method === 'sixty_min', isCp = method === 'cp_test';
+  const factor = sug.factor != null ? sug.factor : (isRamp ? 0.75 : (isHour || isCp) ? 1.0 : 0.95);
+  const base = isRamp ? sug.best_60s : isHour ? sug.best_60min : isCp ? sug.cp_w : sug.best_20min;
+  const baseLabel = isRamp ? 'best sustained minute' : isHour ? 'hour plateau mean'
+    : isCp ? 'critical power from the 12/7/3-min efforts' : 'best 20-min mean';
   const recognised = a.source === 'fit' ? 'from the ride file' : 'from the synced ride';
 
   // ── stepper ──────────────────────────────────────────────────────────
@@ -8600,7 +8606,7 @@ async function renderFtpTestAnalysis(rideId, fs) {
       <div style="font-size:12px;font-weight:700;margin:2px 0;">${title}</div>
       <div style="font-size:11px;color:var(--text2);">${body}</div></div>`;
   let html = `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
-    ${step('1 · RECOGNISE', {ramp:'Ramp test', sixty_min:'60-minute test', coggan_20min:'20-minute test'}[method] || method,
+    ${step('1 · RECOGNISE', {ramp:'Ramp test', sixty_min:'60-minute test', coggan_20min:'20-minute test', cp_test:'Critical Power test'}[method] || method,
            (sug.fallback_from ? 'Hour abandoned early (plateau &lt; 50 min) — scored with the validated 20-min method. ' : '') + recognised)}
     ${step('2 · MEASURE', `${base != null ? base + ' W' : '—'}`, baseLabel + (sug.plateau_min ? ` · ${sug.plateau_min} min sustained` : '') + (a.halted ? ` · halted at step ${esc(String(a.halt_step || '?'))}` : ''))}
     ${step('3 · COMPUTE', `${sug.ftp} W`, `${base != null ? base : '?'} × ${factor} — ${esc(sug.formula_used || '')}`)}
@@ -8791,7 +8797,8 @@ async function openRideDetail(rideId) {
       const deltaColor = delta >= 0 ? '#22c55e' : '#ef4444';
       const methodLabel = fs.method === 'ramp' ? 'Ramp'
         : fs.method === 'coggan_20min' ? 'Coggan 20-min'
-        : fs.method === 'sixty_min' ? '60-min hour of power' : fs.method;
+        : fs.method === 'sixty_min' ? '60-min hour of power'
+        : fs.method === 'cp_test' ? 'Critical Power 12/7/3' : fs.method;
       const haltedBanner = s.ftp_test_halted
         ? `<div style="font-size:11px;color:#ef4444;margin-bottom:8px;">&#9888; Test was halted at step ${esc(String(s.ftp_test_halt_step || 'N'))} &mdash; suggested value may be unreliable.</div>`
         : '';
@@ -18161,6 +18168,7 @@ function _ftpTypeFromFile(zwoFile) {
   if (f.includes('ftp_test_ramp')) return 'ramp';
   if (f.includes('ftp_test_60min')) return 'sixty_min';
   if (f.includes('ftp_test_coggan')) return 'coggan_20min';
+  if (f.includes('ftp_test_cp')) return 'cp_test';
   return null;
 }
 
@@ -19093,6 +19101,7 @@ function ftpTestChooserHtml(sessionIdx, day, currentType, opts) {
       ${card('coggan_20min', TT_SVG, '20-minute test', 'A 5-min all-out effort drains your sprint reserve, then a 20-min max effort; FTP = 95% of the 20-min average.', 'Best-validated protocol in the literature — the depletion effort keeps anaerobic inflation out.', 'Pacing is HARD — go too hard early and you fade, reading LOW. ~60 min total.')}
       ${card('ramp', RAMP_SVG, 'Ramp test', 'Power steps up 6% of FTP each minute until you can\'t hold on; FTP = 75% of your best minute.', 'Quick (~35 min) and pacing-free — just hold each step to failure.', 'The 0.75 factor has no peer-reviewed validation, and punchy/anaerobic riders read HIGH.')}
       ${card('sixty_min', HOUR_SVG, '60-minute test', 'One full hour at the hardest steady pace you can hold; FTP = the hour\'s average power — no correction factor, by definition.', 'Definitional — zero estimation error when paced right.', 'Brutal. Ride the hour with erg OFF at time-trial discipline; blown pacing ruins it. ~86 min total.')}
+      ${card('cp_test', TT_SVG, 'Critical Power test', 'Three all-out efforts of 12, 7 and 3 minutes with 30 minutes of rest between; your power over the three gives your critical power, and FTP is set to it.', 'The field protocol checked against the lab (Karsten 2015); no fixed correction factor.', 'Long (~110 min) and three maximal efforts. CP tends to read a few watts above a 20-min-test FTP.')}
     </div>
   </div>`;
 }
