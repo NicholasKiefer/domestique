@@ -2386,6 +2386,8 @@ window.addEventListener('unhandledrejection', function(e) {
         <div style="font-size:11px;color:var(--text2);font-weight:500;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;">Intermediate races (B / C) — optional</div>
         <div id="plan-bc-rows"></div>
         <button type="button" class="btn btn-sm" onclick="addBcRaceRow()">+ Add race</button>
+        <button type="button" class="btn btn-sm" onclick="icuRacesLoad()" title="Read the A, B and C races in your intervals.icu calendar and choose how each one goes into this plan">Load races from intervals.icu</button>
+        <div id="icu-races-panel" style="display:none;margin-top:8px;"></div>
       </div>
 
       <!-- Per-Day Availability Grid -->
@@ -12610,6 +12612,110 @@ function readBcRaces() {
     });
   });
   return out;
+}
+
+// ═══ 3.13.0: races from intervals.icu ═══════════════════════════════════════
+// Reads the rider's RACE_A/B/C events (read-only) into a table where the
+// rider picks how each one goes into this plan: one race is the plan's goal
+// event, others become B/C rows, the rest are skipped. It only fills the
+// builder's fields; nothing is saved until Generate.
+let _icuRaces = [];
+function _icuRaceDefaults(races) {
+  // The earliest A race is the goal (a plan has one); later A races default
+  // to B. Races in another sport default to skip.
+  let haveA = false;
+  return races.map(function (r) {
+    if (r.sport && !/ride/i.test(r.sport)) return 'skip';
+    if (r.priority !== 'A') return r.priority;
+    if (haveA) return 'B';
+    haveA = true;
+    return 'A';
+  });
+}
+async function icuRacesLoad() {
+  const panel = document.getElementById('icu-races-panel');
+  if (!panel) return;
+  let r;
+  try { r = await (await fetch('/api/icu/races')).json(); } catch (e) { r = {error: 'network'}; }
+  if (r && r.needs_reconnect) {
+    showToast('Reconnect intervals.icu to read your calendar (Settings → Connections).', 6000, 'warning');
+    return;
+  }
+  if (!r || r.error || !Array.isArray(r.races)) {
+    showToast(r && r.error === 'not_connected'
+      ? 'Connect intervals.icu first (Settings → Connections).'
+      : "Couldn't read your intervals.icu calendar — try again in a moment.", 6000, 'error');
+    return;
+  }
+  if (!r.races.length) {
+    showToast('No A, B or C races in your intervals.icu calendar for the coming year.', 5000, 'info');
+    return;
+  }
+  _icuRaces = r.races;
+  const picks = _icuRaceDefaults(r.races);
+  const opt = (v, label, sel) => `<option value="${v}"${sel === v ? ' selected' : ''}>${label}</option>`;
+  panel.innerHTML =
+    '<div style="font-size:11px;color:var(--text2);margin-bottom:6px;">Your races in intervals.icu. Choose how each one goes into this plan. Nothing is saved until you Generate.</div>' +
+    '<table style="width:100%;font-size:12px;border-collapse:collapse;">' +
+    '<tr style="text-align:left;color:var(--text3);"><th>Date</th><th>Race</th><th>Sport</th><th>km</th><th>In this plan</th></tr>' +
+    r.races.map((x, i) =>
+      `<tr><td>${esc(x.date)}</td><td>${esc(x.name || '(no name)')} <span style="color:var(--text3);">(${esc(x.priority)} in intervals.icu)</span></td>` +
+      `<td>${esc(x.sport)}</td><td>${x.distance_km != null ? esc(x.distance_km) : ''}</td>` +
+      `<td><select class="icu-race-pick" data-i="${i}" onchange="icuRacePickChanged(this)">` +
+      opt('A', 'A — plan goal', picks[i]) + opt('B', 'B race', picks[i]) +
+      opt('C', 'C race', picks[i]) + opt('skip', 'Skip', picks[i]) + '</select></td></tr>').join('') +
+    '</table><div style="margin-top:8px;display:flex;gap:6px;">' +
+    '<button type="button" class="btn btn-sm btn-primary" onclick="icuRacesApply()">Use these races</button>' +
+    '<button type="button" class="btn btn-sm" onclick="document.getElementById(\'icu-races-panel\').style.display=\'none\'">Cancel</button></div>';
+  panel.style.display = 'block';
+}
+function icuRacePickChanged(sel) {
+  // One goal per plan: picking A for a race makes the previous A a B race.
+  if (sel.value !== 'A') return;
+  document.querySelectorAll('#icu-races-panel .icu-race-pick').forEach(function (o) {
+    if (o !== sel && o.value === 'A') o.value = 'B';
+  });
+}
+function icuRacesApply() {
+  const picks = Array.from(document.querySelectorAll('#icu-races-panel .icu-race-pick'))
+    .map(sel => ({race: _icuRaces[+sel.dataset.i], pick: sel.value}))
+    .filter(p => p.race);
+  const goal = (picks.find(p => p.pick === 'A') || {}).race || null;
+  if (goal) {
+    const g = document.getElementById('plan-goal');
+    if (g && !_isEventGoal(g.value)) { g.value = 'event'; togglePlanFields(); }
+    document.getElementById('plan-edate').value = goal.date;
+    document.getElementById('plan-ename').value = goal.name || '';
+    if (goal.distance_km) document.getElementById('plan-ekm').value = goal.distance_km;
+    _syncPlanDateToWeeks();
+    // A race can't be the goal and a B/C race too.
+    document.querySelectorAll('#plan-bc-rows .plan-bc-row').forEach(function (row) {
+      if ((row.querySelector('.bc-date') || {}).value === goal.date) row.remove();
+    });
+  }
+  const taken = new Set(readBcRaces().map(x => x.date));
+  if (goal) taken.add(goal.date);
+  let added = 0, later = 0;
+  picks.forEach(function (p) {
+    if ((p.pick !== 'B' && p.pick !== 'C') || taken.has(p.race.date)) return;
+    // An event plan ends on its goal day: a race after it has no week here.
+    if (goal && p.race.date > goal.date) { later++; return; }
+    addBcRaceRow({date: p.race.date, priority: p.pick, name: p.race.name,
+                  event_km: p.race.distance_km || 0});
+    taken.add(p.race.date);
+    added++;
+  });
+  document.getElementById('icu-races-panel').style.display = 'none';
+  if (typeof refreshPlanPreview === 'function') refreshPlanPreview();
+  const parts = [];
+  if (goal) parts.push(`${goal.name || 'your A race'} on ${goal.date} as the plan goal`);
+  if (added) parts.push(`${added} B/C race${added === 1 ? '' : 's'}`);
+  let msg = parts.length
+    ? `Added ${parts.join(' and ')}. Check distance, climb and event type, then Generate.`
+    : 'No races added.';
+  if (later) msg += ` ${later} race${later === 1 ? ' is' : 's are'} after your goal and not in this plan.`;
+  showToast(msg, 7000, parts.length ? 'success' : 'info');
+  return {goal: goal, added: added, later: later};
 }
 
 // ═══ v2.3.0: template intensity-mix % readout + custom split ════════════════

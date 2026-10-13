@@ -8198,6 +8198,68 @@ def api_calendar_push_workout(body: "dict | None" = None):
         return {"error": f"internal:{type(e).__name__}"}
 
 
+_ICU_RACE_PRIORITY = {"RACE_A": "A", "RACE_B": "B", "RACE_C": "C"}
+
+
+@app.get("/api/icu/races")
+def api_icu_races():
+    """Race import (3.13.0): the rider's races planned in intervals.icu
+    (RACE_A / RACE_B / RACE_C events, today .. +365 days) for the plan builder
+    to show. Read-only: the rider maps each race in the builder and Generate
+    saves the plan as usual; nothing is stored here.
+
+    Always 200: {races: [{date, name, priority, sport, distance_km}]} sorted by
+    date, or {needs_reconnect} / {error}. Reading events needs the calendar
+    scope the push already asks for (CALENDAR:WRITE covers READ)."""
+    import icu_calendar_push as _icp
+    from profile_manager import ProfileManager
+    try:
+        pm = ProfileManager.get()
+        if not pm.active_id:
+            return {"error": "no_active_profile"}
+        athlete_id, err = _icp._connection(pm)
+        if err:
+            return {"error": err}
+        if not _icp.write_ok(pm):
+            return {"needs_reconnect": True}
+        today = clock.today()
+        status, body = _icp._http(
+            "GET", f"athlete/{athlete_id}/events?oldest={today.isoformat()}"
+                   f"&newest={(today + timedelta(days=365)).isoformat()}")
+        if _icp._scope_403(status, body):
+            return {"needs_reconnect": True}
+        if status == 0:
+            return {"error": "network"}
+        if not (200 <= status < 300):
+            return {"error": f"http_{status}"}
+        try:
+            rows = json.loads(body or b"[]")
+        except (json.JSONDecodeError, ValueError):
+            return {"error": "bad_response"}
+        races = []
+        for ev in rows if isinstance(rows, list) else []:
+            if not isinstance(ev, dict):
+                continue
+            prio = _ICU_RACE_PRIORITY.get(str(ev.get("category") or ""))
+            day = _icp._event_day(ev)
+            if prio is None or day is None or day < today:
+                continue
+            dist = ev.get("distance")
+            km = (round(float(dist) / 1000.0, 1)
+                  if isinstance(dist, (int, float)) and not isinstance(dist, bool)
+                  and 0 < dist < 2_000_000 else None)
+            races.append({"date": day.isoformat(),
+                          "name": str(ev.get("name") or "").strip()[:120],
+                          "priority": prio,
+                          "sport": str(ev.get("type") or ""),
+                          "distance_km": km})
+        races.sort(key=lambda r: (r["date"], r["priority"], r["name"]))
+        return {"races": races}
+    except Exception as e:                      # always 200, never a 500
+        _log.exception("icu races read failed")
+        return {"error": f"internal:{type(e).__name__}"}
+
+
 @app.get("/api/icu/athlete-numbers")
 def api_icu_athlete_numbers():
     """Pull FTP / weight / LTHR / max-HR from the linked intervals.icu athlete so
