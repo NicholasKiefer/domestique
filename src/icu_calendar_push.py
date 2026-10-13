@@ -709,6 +709,19 @@ def _still_this_workout(s: dict, ev: dict, by_day: dict) -> bool:
                for x in by_day.get(left) or [])
 
 
+def _stand_ins(held: dict, by_day: dict, profile_id: str, names) -> dict:
+    """external_id → the rider's moved copy, for every id a push must leave
+    alone: each held id, and the id its session is planned under now (so a
+    later auto-reschedule or swap cannot put the workout on two days)."""
+    out = {}
+    for eid, (enc, n, ev) in held.items():
+        out[eid] = ev
+        loc, _ = _resolve_moved_session(by_day, enc, n, ev, names)
+        if loc is not None:
+            out.setdefault(f"{_ID_ROOT}{profile_id}:{loc[0]}:{loc[1]}", ev)
+    return out
+
+
 # #28 (grill_cal M-3): the sync thread, the 30 s debounce timer and the Push
 # button can each start a reconcile; two overlapping bulk upserts of a new
 # external_id could leave two events under one id. One run at a time.
@@ -743,6 +756,37 @@ def reconcile(horizon_days: int = HORIZON_DAYS) -> dict:
     out = _one_at_a_time(_RECONCILE_LOCK_TIMEOUT_S, _reconcile, horizon_days)
     out.setdefault("held", 0)
     return out
+
+
+def moved_copy_day(athlete_id: str, plan: dict, external_id: str,
+                   profile_id: str, horizon_days: int):
+    """The single "Send to intervals.icu" push of a planned session (#28):
+    would upserting ``external_id`` pull back, or copy, a workout the rider
+    moved in intervals.icu? Returns (day of the rider's copy, None) when it
+    would, (None, None) when the push is free, (None, error_result) when the
+    window GET failed (then nothing may be pushed). Reads the same window
+    and applies the same hold as reconcile; the caller holds the reconcile
+    lock across this and its upsert. Never writes."""
+    import app as _app
+    today = clock.today()
+    existing, err_res = _get_window_events(
+        athlete_id, today, horizon_days, _LOOKBACK_DAYS, _LOOKAHEAD_DAYS)
+    if err_res is not None:
+        return None, err_res
+    by_day = _sessions_by_day(plan)
+    names = functools.lru_cache(maxsize=None)(
+        lambda: _load_classifications(Path(_app.WORKOUT_DIR)))
+    held, agreed = _held_ids(existing, by_day, profile_id, today, names)
+    ev = _stand_ins(held, by_day, profile_id, names).get(external_id)
+    if ev is None:
+        # The plan followed the move: the rider's copy (still under the old
+        # id until the next reconcile replaces it) is this workout on this
+        # day, so a push now would put it there twice.
+        old = next((eid for eid, new_id in agreed.items()
+                    if new_id == external_id), None)
+        ev = next((e for e in existing if isinstance(e, dict)
+                   and str(e.get("external_id") or "") == old), None) if old else None
+    return (_event_day(ev).isoformat() if ev is not None else None), None
 
 
 def _reconcile(horizon_days: int) -> dict:
@@ -791,11 +835,7 @@ def _reconcile(horizon_days: int) -> dict:
         result["held"] = sum(1 for _e, _n, ev in held.values()
                              if _event_day(ev) >= today)
         if held:
-            stand_ins = set(held)
-            for enc, n, ev in held.values():
-                loc, _ = _resolve_moved_session(by_day, enc, n, ev, names)
-                if loc is not None:
-                    stand_ins.add(f"{_ID_ROOT}{profile_id}:{loc[0]}:{loc[1]}")
+            stand_ins = _stand_ins(held, by_day, profile_id, names)
             desired = [ev for ev in desired
                        if ev["external_id"] not in stand_ins]
 

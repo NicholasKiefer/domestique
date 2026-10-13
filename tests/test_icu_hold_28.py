@@ -995,5 +995,107 @@ def test_w9_swap_search_needs_the_events_file():
     assert icp._resolve_moved_session(by_day, D["wed"], 0, ev, lambda: {}) == (None, False)
 
 
+# ── the workout's own "Send to intervals.icu" button (rider report) ──────────
+
+def _send(env, day, zwo):
+    return env.client.post("/api/calendar/push-workout", json={
+        "source": "planner", "zwo_file": zwo, "date": day}).json()
+
+
+@pytest.mark.parametrize("echo", [True, False])
+def test_send_button_leaves_a_workout_moved_in_icu_where_it_is(env, echo):
+    """Rider report: send today's workout, drag it to tomorrow in
+    intervals.icu, send today's workout again — it jumped back to today."""
+    env.fk.echo_filename = echo
+    _write_plan(_week(mon="steady.zwo", wed="sweet.zwo"))
+    assert _send(env, D["mon"], "steady.zwo")["pushed"] == 1
+    mon0 = _eid(env, D["mon"])
+    env.fk.drag(mon0, D["tue"])
+    mark = len(env.fk.calls)
+    r = _send(env, D["mon"], "steady.zwo")
+    assert r == {"ok": True, "pushed": 0, "kept_on": D["tue"]}
+    assert [c[0] for c in env.fk.calls[mark:]] == ["GET"]
+    assert env.fk.where(mon0) == [D["tue"]]
+    assert _send(env, D["wed"], "sweet.zwo")["pushed"] == 1    # the rest still goes
+    _one_event_per_session(env)
+
+
+def test_send_button_pushes_no_second_copy_of_a_moved_workout(env):
+    """The rider moved Wed to Fri in intervals.icu; the plan then moved Wed
+    to Thu on its own. Sending Thu would put the workout on two days."""
+    ss = _week(wed="steady.zwo")
+    _seed(env, ss)
+    wed0 = _eid(env, D["wed"])
+    env.fk.drag(wed0, D["fri"])
+    _write_plan(_move(ss, D["wed"], D["thu"], auto=True))
+    mark = len(env.fk.calls)
+    assert _send(env, D["thu"], "steady.zwo") == {"ok": True, "pushed": 0, "kept_on": D["fri"]}
+    assert [c[0] for c in env.fk.calls[mark:]] == ["GET"]
+    _one_event_per_session(env)
+
+
+def test_send_button_after_the_same_move_in_both_places_adds_no_copy(env):
+    ss = _week(wed="steady.zwo")
+    _seed(env, ss)
+    env.fk.drag(_eid(env, D["wed"]), D["fri"])
+    _write_plan(_move(ss, D["wed"], D["fri"]))
+    mark = len(env.fk.calls)
+    assert _send(env, D["fri"], "steady.zwo") == {"ok": True, "pushed": 0, "kept_on": D["fri"]}
+    assert [c[0] for c in env.fk.calls[mark:]] == ["GET"]
+    _one_event_per_session(env)
+
+
+def test_send_button_still_updates_an_unmoved_workout(env):
+    _seed(env, _week(wed="steady.zwo"))
+    mark = len(env.fk.calls)
+    r = _send(env, D["wed"], "steady.zwo")
+    assert r == {"ok": True, "pushed": 1, "event_date": D["wed"]}
+    assert [c[0] for c in env.fk.calls[mark:]] == ["GET", "POST"]
+    assert env.fk.where(_eid(env, D["wed"])) == [D["wed"]]
+
+
+def test_send_button_pushes_nothing_when_the_calendar_cannot_be_read(env):
+    _write_plan(_week(wed="steady.zwo"))
+    env.fk.fail["GET"] = (500, b"down")
+    r = _send(env, D["wed"], "steady.zwo")
+    assert r == {"error": "http_500"}
+    assert [c[0] for c in env.fk.calls] == ["GET"]
+
+
+def test_send_button_waits_for_a_running_calendar_update(env, monkeypatch):
+    _write_plan(_week(wed="steady.zwo"))
+    monkeypatch.setattr(icp, "_RECONCILE_LOCK_TIMEOUT_S", 0.05)
+    assert icp._RECONCILE_LOCK.acquire(timeout=1)
+    try:
+        assert _send(env, D["wed"], "steady.zwo")["error"] == "busy"
+    finally:
+        icp._RECONCILE_LOCK.release()
+    assert env.fk.calls == []
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_send_button_toast_says_where_the_workout_stayed():
+    src = DASHBOARD.read_text(encoding="utf-8")
+    harness = _extract_js_function(src, "_pushWorkoutToCalendar") + """
+const seen = [];
+global.showToast = (m) => seen.push(m);
+const replies = [{ok: true, pushed: 0, kept_on: '2026-10-20'},
+                 {ok: true, pushed: 1, event_date: '2026-10-19'},
+                 {pushed: 0, error: 'busy'}];
+global.fetch = async () => ({json: async () => replies.shift()});
+(async () => {
+  for (let i = 0; i < 3; i++) await _pushWorkoutToCalendar('planner', 'a.zwo', '2026-10-19', '');
+  const want = [
+    'Already on your intervals.icu calendar for 2026-10-20, where you moved it — left there',
+    'On your intervals.icu calendar for 2026-10-19 — Garmin / Wahoo / MyWhoosh will pull it automatically',
+    'A calendar update is already running — try again in a moment.',
+  ];
+  if (JSON.stringify(seen) !== JSON.stringify(want)) throw new Error(JSON.stringify(seen));
+  console.log('OK');
+})().catch(e => { console.error(e); process.exit(1); });
+"""
+    _run_node(harness)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

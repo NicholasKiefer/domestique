@@ -3853,8 +3853,13 @@ async function _pushWorkoutToCalendar(source, zwoFile, dateIso, name) {
                             name: name || ''})});
     r = await res.json();
   } catch (e) { r = {error: 'network'}; }
-  if (r && r.ok) {
+  if (r && r.ok && r.kept_on) {
+    // #28: the rider moved this workout in intervals.icu; it stays there.
+    showToast(`Already on your intervals.icu calendar for ${r.kept_on}, where you moved it — left there`, 6000, 'success');
+  } else if (r && r.ok) {
     showToast(`On your intervals.icu calendar for ${dateIso} — Garmin / Wahoo / MyWhoosh will pull it automatically`, 6000, 'success');
+  } else if (r && r.error === 'busy') {
+    showToast('A calendar update is already running — try again in a moment.', 6000, 'warning');
   } else if (r && r.needs_reconnect) {
     showToast('Reconnect intervals.icu to grant calendar access', 6000, 'warning');
   } else if (r && r.needs_lthr) {

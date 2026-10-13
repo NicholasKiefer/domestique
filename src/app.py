@@ -8009,6 +8009,10 @@ def api_calendar_push_workout(body: "dict | None" = None):
         client index or a hand-rolled <n> (grill amendment 2). O1: the horizon is
         extended to cover a target day beyond the 14-day auto-sync window.
 
+    #28: a planned session the rider moved in intervals.icu is not pushed —
+    {ok, pushed: 0, kept_on: <the day it is on there>} — and the planner push
+    waits for a running reconcile ({error: "busy"} after a minute).
+
     ALWAYS HTTP 200 with a data dict ({ok,pushed,event_date} / {needs_reconnect}
     / {needs_lthr} / {error}) — never a 4xx/500, so the shared toast handler reads
     the fields (amendment 7; mirrors api_icu_push). Guard chain mirrors reconcile
@@ -8117,20 +8121,44 @@ def api_calendar_push_workout(body: "dict | None" = None):
                 return {"error": "not a pushable planned session"}
             events = [event]
 
-        # ONE bulk upsert (idempotent on external_id) via the engine's own seam —
-        # the SAME transport reconcile uses, so 403-scope maps to needs_reconnect.
-        status, resp = _icp._http(
-            "POST", f"athlete/{athlete_id}/events/bulk?upsert=true",
-            payload=events)
-        if _icp._scope_403(status, resp):
-            return {"needs_reconnect": True}
-        if status == 0:
-            return {"error": "network"}
-        if not (200 <= status < 300):
-            return {"error": f"http_{status}"}
-        _log.info("EVENT=icu_calendar_push_workout source=%s date=%s pushed=1",
-                  source, date_iso)
-        return {"ok": True, "pushed": 1, "event_date": date_iso}
+        def _send():
+            # ONE bulk upsert (idempotent on external_id) via the engine's own
+            # seam — the SAME transport reconcile uses, so 403-scope maps to
+            # needs_reconnect.
+            status, resp = _icp._http(
+                "POST", f"athlete/{athlete_id}/events/bulk?upsert=true",
+                payload=events)
+            if _icp._scope_403(status, resp):
+                return {"needs_reconnect": True}
+            if status == 0:
+                return {"error": "network"}
+            if not (200 <= status < 300):
+                return {"error": f"http_{status}"}
+            _log.info("EVENT=icu_calendar_push_workout source=%s date=%s pushed=1",
+                      source, date_iso)
+            return {"ok": True, "pushed": 1, "event_date": date_iso}
+
+        if source == "library":
+            return _send()
+
+        def _send_unless_moved():
+            # #28: the upsert is keyed by external_id, which a drag in the
+            # intervals.icu calendar keeps — pushing blindly pulled a workout
+            # the rider moved there back to its planned day. Read the window
+            # first, under the reconcile lock, and leave it where they put it.
+            kept_on, err_res = _icp.moved_copy_day(
+                athlete_id, plan, event["external_id"], profile_id, horizon)
+            if err_res is not None:
+                if err_res.get("needs_reconnect"):
+                    return {"needs_reconnect": True}
+                return {"error": err_res.get("error") or "network"}
+            if kept_on is not None:
+                _log.info("EVENT=icu_calendar_push_workout source=planner "
+                          "date=%s pushed=0 kept_on=%s", date_iso, kept_on)
+                return {"ok": True, "pushed": 0, "kept_on": kept_on}
+            return _send()
+
+        return _icp._one_at_a_time(_icp._RECONCILE_LOCK_TIMEOUT_S, _send_unless_moved)
     except Exception as e:                      # amendment 7: zero 500s, ever
         _log.exception("calendar push-workout endpoint failed")
         return {"error": f"internal:{type(e).__name__}"}
