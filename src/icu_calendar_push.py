@@ -754,9 +754,24 @@ def reconcile(horizon_days: int = HORIZON_DAYS) -> dict:
     or later left where the rider moved them in intervals.icu (#28); it is 0
     on every early return (W6). Never raises; never writes the plan.
     """
-    out = _one_at_a_time(_RECONCILE_LOCK_TIMEOUT_S, _reconcile, horizon_days)
+    out = _one_at_a_time(_RECONCILE_LOCK_TIMEOUT_S, _reconcile_unless_swept,
+                         horizon_days, _SWEEP_GENERATION)
     out.setdefault("held", 0)
     return out
+
+
+# A sweep_all (sync turned off, disconnect) bumps this. A reconcile that was
+# already waiting for the lock when the sweep ran must not push everything
+# back afterwards (3.13.0 review): it reads the generation before waiting and
+# gives up, as "swept", when it changed.
+_SWEEP_GENERATION = 0
+
+
+def _reconcile_unless_swept(horizon_days: int, generation: int) -> dict:
+    if generation != _SWEEP_GENERATION:
+        _log.info("EVENT=icu_calendar_push_skipped reason=swept")
+        return _result(error="swept")
+    return _reconcile(horizon_days)
 
 
 def moved_copy_day(athlete_id: str, plan: dict, external_id: str,
@@ -809,7 +824,7 @@ def _reconcile(horizon_days: int) -> dict:
         today = clock.today()
         desired, skipped, broken_ids = _desired_events(
             pm, plan, today, horizon_days, profile_id)
-        result = _result(skipped=skipped)
+        result = _result(skipped=skipped, profile_id=profile_id)
         if any(s.get("reason") == "needs_lthr" for s in skipped):
             result["needs_lthr"] = True
 
@@ -927,7 +942,15 @@ def sweep_all(horizon_days: int = HORIZON_DAYS) -> dict:
     held rider moves included, also those moved up to 7 days past the
     horizon (W7: toggle off means everything ours goes). Past days are
     never touched. Waits up to 120 s for a running reconcile. Never raises."""
-    return _one_at_a_time(_SWEEP_LOCK_TIMEOUT_S, _sweep_all, horizon_days)
+    return _one_at_a_time(_SWEEP_LOCK_TIMEOUT_S, _sweep_then_bump, horizon_days)
+
+
+def _sweep_then_bump(horizon_days: int) -> dict:
+    global _SWEEP_GENERATION
+    try:
+        return _sweep_all(horizon_days)
+    finally:
+        _SWEEP_GENERATION += 1
 
 
 def _sweep_all(horizon_days: int) -> dict:

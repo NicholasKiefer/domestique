@@ -98,7 +98,7 @@ def _tp_log_error(code: str, exc: Exception | None = None, **context) -> None:
         pass
 
 
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field, asdict, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -424,6 +424,22 @@ def plan_write_lock():
     """
     with _plan_write_lock:
         yield
+
+
+@asynccontextmanager
+async def plan_write_lock_async():
+    """The plan lock for ``async def`` endpoints. A blocking acquire on the
+    event-loop thread froze every request while a worker thread held the lock
+    (3.13.0 review); this waits off the loop instead. The body must not await
+    (tests/test_plan_lock_32.py checks): the loop thread owns the RLock, and
+    another coroutine on that thread could re-enter it."""
+    import asyncio
+    while not _plan_write_lock.acquire(blocking=False):
+        await asyncio.sleep(0.02)
+    try:
+        yield
+    finally:
+        _plan_write_lock.release()
 
 
 def _rotate_plan_backups(plan_path: "Path") -> None:

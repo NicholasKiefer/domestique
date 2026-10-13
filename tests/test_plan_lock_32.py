@@ -34,10 +34,12 @@ _WRITES_UNDER_CALLER_LOCK = {
 
 
 def _is_plan_lock(node: ast.AST) -> bool:
-    return isinstance(node, ast.With) and any(
+    # async endpoints take it with `async with tp.plan_write_lock_async()`
+    return isinstance(node, (ast.With, ast.AsyncWith)) and any(
         isinstance(i.context_expr, ast.Call)
         and isinstance(i.context_expr.func, ast.Attribute)
-        and i.context_expr.func.attr == "plan_write_lock" for i in node.items)
+        and i.context_expr.func.attr in ("plan_write_lock", "plan_write_lock_async")
+        for i in node.items)
 
 
 def test_every_plan_write_in_app_is_under_the_plan_lock():

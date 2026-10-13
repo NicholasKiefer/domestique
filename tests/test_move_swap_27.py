@@ -710,10 +710,14 @@ def test_a_busy_debounced_calendar_push_is_re_armed_once(monkeypatch):
     try:
         app._icu_push_debounced_run("pid-w16")
         t = armed()
-        assert t is not None and t.args == ("pid-w16", True)  # re-armed, as the retry
+        assert t is not None and t.args == ("pid-w16", 1)     # re-armed, as retry 1
 
-        app._icu_push_debounced_run("pid-w16", True)           # the retry is busy too
-        assert armed() is None                                  # once only
+        app._icu_push_debounced_run("pid-w16", 1)              # the retry is busy too
+        t = armed()
+        assert t is not None and t.args == ("pid-w16", 2)     # 3.13.0: keeps trying
+
+        app._icu_push_debounced_run("pid-w16", 10)             # but not forever
+        assert armed() is None
 
         result["res"] = {"pushed": 1, "updated": 0, "deleted": 0}
         app._icu_push_debounced_run("pid-w16")
