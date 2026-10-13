@@ -464,8 +464,10 @@ def _rotate_plan_backups(plan_path: "Path") -> None:
 # debounced ICU-calendar push scheduler here at boot (AFTER the boot-time
 # restore/rewrite writes); the CLI path never registers, so plain
 # `python training_planner.py` stays network-silent. Called with the plan
-# Path AFTER the atomic rename, OUTSIDE the write lock; failures are logged
-# and swallowed — a broken callback must never break a plan write.
+# Path AFTER the atomic rename, outside atomic_write_plan's own critical
+# section (a caller may still hold the plan RLock around its read-modify-write,
+# #32; the callback only arms a timer); failures are logged and swallowed — a
+# broken callback must never break a plan write.
 post_write_callback = None
 
 
@@ -12013,8 +12015,12 @@ def reforecast(
                     new_dur = min(int(round(hours * 60)), MAX_AVAIL_SESSION_MIN)
                     tss_per_h = TSS_PER_HOUR.get("z2", 45)
                     new_dur = _fits_budget(new_dur, tss_per_h, _budget, _planned)
-                    if new_dur <= 0:
-                        continue        # the week is already at its budget
+                    if new_dur < _VOLUME_MIN_SESSION_MIN:
+                        # #35: a week a few TSS under budget left room for a
+                        # 1- to 6-minute "restored" ride, which a later rematch
+                        # filled with a 240-minute file. Below the floor a
+                        # session is noise: the day stays rest.
+                        continue
                     s.session_type = "z2"
                     s.duration_min = new_dur
                     s.tss_estimate = round(new_dur / 60 * tss_per_h)
@@ -12022,6 +12028,19 @@ def reforecast(
                     s.description = f"z2 ({new_dur}min) — restored from rest"
                     s.zwo_file = ""
                     s.zwo_name = ""
+                    # #35: the restored ride is the planner's. Pins and marks
+                    # left by a session the rider once moved, swapped or had
+                    # adapted on this day (rested since, by a 0 h day) describe
+                    # that session, not this one: pins froze it against resize
+                    # and regen, and a stale pre_adapt let revert-cap bring the
+                    # old session back over it.
+                    s.user_moved = False
+                    s.user_swapped = False
+                    s.moved_from = ""
+                    s.adapted = False
+                    for _k in _PS_JSON_ONLY_KEYS:
+                        if hasattr(s, _k):
+                            delattr(s, _k)
                 elif getattr(s, "user_swapped", False) or getattr(s, "user_moved", False):
                     # A pinned day — swap-type, accepted redraw, FTP-test
                     # choice — keeps the workout the rider chose. Applying the
