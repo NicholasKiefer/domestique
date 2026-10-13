@@ -3944,132 +3944,133 @@ async def api_readiness_apply_tier_down(request: Request):
     if not json_path.exists():
         return JSONResponse({"error": "No active plan found"}, 404)
     try:
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
-        target = None
-        target_week = None
-        for w in plan.get("weeks", []):
-            for s in w.get("sessions", []):
-                if s.get("day") == day_iso:
-                    target = s
-                    target_week = w
+        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
+            target = None
+            target_week = None
+            for w in plan.get("weeks", []):
+                for s in w.get("sessions", []):
+                    if s.get("day") == day_iso:
+                        target = s
+                        target_week = w
+                        break
+                if target:
                     break
-            if target:
-                break
-        if not target or not target_week:
-            return JSONResponse({"error": f"No session at {day_iso}"}, 404)
-        old_type = target.get("session_type", "") or ""
-        if old_type in ("rest", "recovery"):
-            return {"ok": False, "action": "already_easy", "day": day_iso,
-                    "session_type": old_type}
-        # v1.8.3 BUG-D — distinguish error reasons so the user gets a
-        # specific toast instead of the generic "could not apply: no_change":
-        #   1. session_type unknown to the Seiler ladder → unknown_type
-        #   2. session_type is already at the practical intensity bottom
-        #      (z2 / long_z2 — these ARE in the ladder but dropping them
-        #      yields a longer/lower-volume z2, not a real intensity tier-down)
-        #      → already_at_bottom
-        #   3. _drop_intensity returns same value defensively → no_change (kept)
-        if old_type not in tp._INTENSITY_LADDER:
-            return {"ok": False, "action": "unknown_type", "day": day_iso,
-                    "session_type": old_type}
-        if old_type in ("z2", "long_z2"):
-            return {"ok": False, "action": "already_at_bottom", "day": day_iso,
-                    "session_type": old_type}
-        new_type = tp._drop_intensity(old_type)
-        if not new_type or new_type == old_type:
-            return {"ok": False, "action": "no_change", "day": day_iso,
-                    "session_type": old_type}
+            if not target or not target_week:
+                return JSONResponse({"error": f"No session at {day_iso}"}, 404)
+            old_type = target.get("session_type", "") or ""
+            if old_type in ("rest", "recovery"):
+                return {"ok": False, "action": "already_easy", "day": day_iso,
+                        "session_type": old_type}
+            # v1.8.3 BUG-D — distinguish error reasons so the user gets a
+            # specific toast instead of the generic "could not apply: no_change":
+            #   1. session_type unknown to the Seiler ladder → unknown_type
+            #   2. session_type is already at the practical intensity bottom
+            #      (z2 / long_z2 — these ARE in the ladder but dropping them
+            #      yields a longer/lower-volume z2, not a real intensity tier-down)
+            #      → already_at_bottom
+            #   3. _drop_intensity returns same value defensively → no_change (kept)
+            if old_type not in tp._INTENSITY_LADDER:
+                return {"ok": False, "action": "unknown_type", "day": day_iso,
+                        "session_type": old_type}
+            if old_type in ("z2", "long_z2"):
+                return {"ok": False, "action": "already_at_bottom", "day": day_iso,
+                        "session_type": old_type}
+            new_type = tp._drop_intensity(old_type)
+            if not new_type or new_type == old_type:
+                return {"ok": False, "action": "no_change", "day": day_iso,
+                        "session_type": old_type}
 
-        old_duration = int(target.get("duration_min", 0) or 0)
-        old_tss = float(target.get("tss_estimate", 0) or 0)
-        # issue #3: a tier-DOWN must never INCREASE load. The rule now lives in
-        # tp._deescalated_load so every gate that walks the ladder shares it.
-        new_duration, new_tss = tp._deescalated_load(
-            old_duration, new_type, old_tss)
-        target["session_type"] = new_type
-        target["duration_min"] = new_duration
-        target["tss_estimate"] = new_tss
-        target["adapted"] = True
-        target["adapted_reason"] = f"Tier-down: {old_type} → {new_type} (readiness)"
-        target["status"] = "pending"
+            old_duration = int(target.get("duration_min", 0) or 0)
+            old_tss = float(target.get("tss_estimate", 0) or 0)
+            # issue #3: a tier-DOWN must never INCREASE load. The rule now lives in
+            # tp._deescalated_load so every gate that walks the ladder shares it.
+            new_duration, new_tss = tp._deescalated_load(
+                old_duration, new_type, old_tss)
+            target["session_type"] = new_type
+            target["duration_min"] = new_duration
+            target["tss_estimate"] = new_tss
+            target["adapted"] = True
+            target["adapted_reason"] = f"Tier-down: {old_type} → {new_type} (readiness)"
+            target["status"] = "pending"
 
-        # Re-match ZWO to the new session-type bucket.
-        try:
-            library = tp.load_workout_library()
-            planned = tp.PlannedSession(
-                day=date.fromisoformat(day_iso),
-                day_name=target.get("day_name", ""),
-                session_type=new_type,
-                duration_min=new_duration,
-                tss_estimate=new_tss,
-                description=target.get("description", ""),
-            )
-            week_num = target_week.get("week_num", 0)
-            day_idx = (date.fromisoformat(day_iso)
-                       - date.fromisoformat(target_week["start"])).days
-            old_zwo_name = target.get("zwo_name", "")
-            excluded = {old_zwo_name} if old_zwo_name else set()
-            tp.match_zwo(
-                planned, library,
-                week_num=week_num, day_idx=day_idx,
-                used_names=excluded, raise_on_empty=True,
-                hr_bias=_hr_bias(),
-             micro_only=bool(((plan or {}).get("goal") or {}).get("vo2_microintervals_only", False)),)
-            target["zwo_file"] = planned.zwo_file
-            target["zwo_name"] = planned.zwo_name
-        except tp.NoCandidateWorkoutError:
-            # Library has nothing in the new bucket — clear so the UI
-            # shows unmatched state instead of the wrong workout.
-            target["zwo_file"] = ""
-            target["zwo_name"] = ""
-        except Exception:
-            _log.exception("apply-tier-down re-match swallowed")
-
-        plan["last_tier_down"] = {
-            "date": day_iso,
-            "at": clock.now().isoformat(),
-            "old_type": old_type,
-            "new_type": new_type,
-        }
-
-        # Downstream reforecast (mirrors accept-redraw + save-availability).
-        try:
+            # Re-match ZWO to the new session-type bucket.
             try:
-                activities = db.query_activities(days=120)
+                library = tp.load_workout_library()
+                planned = tp.PlannedSession(
+                    day=date.fromisoformat(day_iso),
+                    day_name=target.get("day_name", ""),
+                    session_type=new_type,
+                    duration_min=new_duration,
+                    tss_estimate=new_tss,
+                    description=target.get("description", ""),
+                )
+                week_num = target_week.get("week_num", 0)
+                day_idx = (date.fromisoformat(day_iso)
+                           - date.fromisoformat(target_week["start"])).days
+                old_zwo_name = target.get("zwo_name", "")
+                excluded = {old_zwo_name} if old_zwo_name else set()
+                tp.match_zwo(
+                    planned, library,
+                    week_num=week_num, day_idx=day_idx,
+                    used_names=excluded, raise_on_empty=True,
+                    hr_bias=_hr_bias(),
+                 micro_only=bool(((plan or {}).get("goal") or {}).get("vo2_microintervals_only", False)),)
+                target["zwo_file"] = planned.zwo_file
+                target["zwo_name"] = planned.zwo_name
+            except tp.NoCandidateWorkoutError:
+                # Library has nothing in the new bucket — clear so the UI
+                # shows unmatched state instead of the wrong workout.
+                target["zwo_file"] = ""
+                target["zwo_name"] = ""
             except Exception:
-                activities = []
-            try:
-                training_snap = cached("training", get_today_metrics)
-                current_tsb = training_snap.get("tsb")
-            except Exception:
-                current_tsb = None
-            tsb_series: "dict | None" = None
-            if current_tsb is not None:
-                tsb_series = {}
-                for w in plan.get("weeks", []) or []:
-                    try:
-                        ws = date.fromisoformat(w["start"])
-                    except (KeyError, ValueError, TypeError):
-                        continue
-                    for i in range(7):
-                        tsb_series[ws + timedelta(days=i)] = current_tsb
-            avail = {
-                day_iso2: float(entry["hours"])
-                for day_iso2, entry in plan.get("availability", {}).items()
-                if isinstance(entry, dict) and "hours" in entry
+                _log.exception("apply-tier-down re-match swallowed")
+
+            plan["last_tier_down"] = {
+                "date": day_iso,
+                "at": clock.now().isoformat(),
+                "old_type": old_type,
+                "new_type": new_type,
             }
-            plan, _modified, _ri = tp.reforecast_dict(
-                plan,
-                today_iso=clock.today().isoformat(),
-                tsb_series=tsb_series,
-                recent_activities=activities,
-                availability_overrides=avail,
-            )
-        except Exception:
-            _log.exception("apply-tier-down reforecast skipped")
 
-        tp.atomic_write_plan(json_path, plan)
+            # Downstream reforecast (mirrors accept-redraw + save-availability).
+            try:
+                try:
+                    activities = db.query_activities(days=120)
+                except Exception:
+                    activities = []
+                try:
+                    training_snap = cached("training", get_today_metrics)
+                    current_tsb = training_snap.get("tsb")
+                except Exception:
+                    current_tsb = None
+                tsb_series: "dict | None" = None
+                if current_tsb is not None:
+                    tsb_series = {}
+                    for w in plan.get("weeks", []) or []:
+                        try:
+                            ws = date.fromisoformat(w["start"])
+                        except (KeyError, ValueError, TypeError):
+                            continue
+                        for i in range(7):
+                            tsb_series[ws + timedelta(days=i)] = current_tsb
+                avail = {
+                    day_iso2: float(entry["hours"])
+                    for day_iso2, entry in plan.get("availability", {}).items()
+                    if isinstance(entry, dict) and "hours" in entry
+                }
+                plan, _modified, _ri = tp.reforecast_dict(
+                    plan,
+                    today_iso=clock.today().isoformat(),
+                    tsb_series=tsb_series,
+                    recent_activities=activities,
+                    availability_overrides=avail,
+                )
+            except Exception:
+                _log.exception("apply-tier-down reforecast skipped")
+
+            tp.atomic_write_plan(json_path, plan)
         return {
             "ok": True,
             "day": day_iso,
@@ -4178,194 +4179,195 @@ async def api_plan_auto_adjust(request: Request):
     json_path = _plan_dir() / "current_plan.json"
     if not json_path.exists():
         return JSONResponse({"error": "No active plan found"}, 404)
-    try:
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
-    except Exception:
-        _log.exception("auto-adjust: plan load failed")
-        return JSONResponse({"error": "plan load failed"}, 500)
+    with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+        try:
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
+        except Exception:
+            _log.exception("auto-adjust: plan load failed")
+            return JSONResponse({"error": "plan load failed"}, 500)
 
-    # 4. Build working copy for dry-run.
-    import copy as _copy
-    working = _copy.deepcopy(plan) if dry_run else plan
+        # 4. Build working copy for dry-run.
+        import copy as _copy
+        working = _copy.deepcopy(plan) if dry_run else plan
 
-    actions: list[dict] = []
-    note = ""
+        actions: list[dict] = []
+        note = ""
 
-    # 5. severity=rest → single-day rest. `scope='day'` targets tomorrow,
-    # everything else (including 'week' collapse) targets today.
-    if severity == "rest":
-        target = None
-        for w in working.get("weeks", []) or []:
-            for s in w.get("sessions", []) or []:
-                if s.get("day") == target_iso:
-                    target = s
-                    break
-            if target:
-                break
-        # FC3 (v2.5.0, L3-7): severity=rest must never wipe the race day — the
-        # readiness card's "Apply rest day" button on race eve converted the
-        # race to rest/0min/no-zwo (the race chip floating over a rest cell).
-        if target is not None and target.get("is_race"):
-            note = "race day is fixed — edit the race instead"
+        # 5. severity=rest → single-day rest. `scope='day'` targets tomorrow,
+        # everything else (including 'week' collapse) targets today.
+        if severity == "rest":
             target = None
-        if target is not None:
-            old_type = target.get("session_type", "") or ""
-            old_duration = int(target.get("duration_min", 0) or 0)
-            old_tss = float(target.get("tss_estimate", 0) or 0)
-            target["session_type"] = "rest"
-            target["tss_estimate"] = 0
-            target["duration_min"] = 0
-            target["zwo_file"] = ""
-            target["zwo_name"] = ""
-            target["adapted"] = True
-            target["adapted_reason"] = "Auto-adjust: rest (severity=rest)"
-            target["status"] = "pending"
-            actions.append({
-                "day": target_iso,
-                "before": {"type": old_type, "duration_min": old_duration, "tss": old_tss},
-                "after": {"type": "rest", "duration_min": 0, "tss": 0.0},
-                "rematched": False,
-                "zwo_cleared": True,
-            })
-        if scope == "week":
-            note = "week scope ignored for severity=rest; applies to today only"
-
-    # 6. severity=tier_down.
-    elif severity == "tier_down":
-        if scope == "today":
-            # Walk today only — mirror apply-tier-down body inline so we
-            # share the dry-run path.
-            target = None
-            target_week = None
             for w in working.get("weeks", []) or []:
                 for s in w.get("sessions", []) or []:
-                    if s.get("day") == today_iso:
+                    if s.get("day") == target_iso:
                         target = s
-                        target_week = w
                         break
                 if target:
                     break
-            if target is not None and target_week is not None:
+            # FC3 (v2.5.0, L3-7): severity=rest must never wipe the race day — the
+            # readiness card's "Apply rest day" button on race eve converted the
+            # race to rest/0min/no-zwo (the race chip floating over a rest cell).
+            if target is not None and target.get("is_race"):
+                note = "race day is fixed — edit the race instead"
+                target = None
+            if target is not None:
                 old_type = target.get("session_type", "") or ""
-                if old_type in tp._HARD_SESSION_TYPES:
-                    new_type = tp._drop_intensity(old_type)
-                    old_duration = int(target.get("duration_min", 0) or 0)
-                    old_tss = float(target.get("tss_estimate", 0) or 0)
-                    new_duration, new_tss = tp._deescalated_load(
-                        old_duration, new_type, old_tss)
-                    target["session_type"] = new_type
-                    target["duration_min"] = new_duration
-                    target["tss_estimate"] = new_tss
-                    target["adapted"] = True
-                    target["adapted_reason"] = (
-                        f"Auto-adjust: {old_type} → {new_type} (severity=tier_down)"
-                    )
-                    target["status"] = "pending"
-                    rematched = False
-                    zwo_cleared = False
-                    try:
-                        library = tp.load_workout_library()
-                        planned = tp.PlannedSession(
-                            day=date.fromisoformat(today_iso),
-                            day_name=target.get("day_name", ""),
-                            session_type=new_type,
-                            # v3.6.0: match on the NEW duration. The tier-down
-                            # now trims duration to hold the load, so matching
-                            # on the old one attached a workout longer than the
-                            # session it was attached to.
-                            duration_min=new_duration,
-                            tss_estimate=new_tss,
-                            description=target.get("description", ""),
-                        )
-                        week_num = target_week.get("week_num", 0)
-                        try:
-                            day_idx = (date.fromisoformat(today_iso)
-                                       - date.fromisoformat(target_week["start"])).days
-                        except (KeyError, ValueError, TypeError):
-                            day_idx = 0
-                        old_zwo_name = target.get("zwo_name", "")
-                        excluded = {old_zwo_name} if old_zwo_name else set()
-                        tp.match_zwo(
-                            planned, library,
-                            week_num=week_num, day_idx=day_idx,
-                            used_names=excluded, raise_on_empty=True,
-                            hr_bias=_hr_bias(),
-                         micro_only=bool(((plan or {}).get("goal") or {}).get("vo2_microintervals_only", False)),)
-                        target["zwo_file"] = planned.zwo_file
-                        target["zwo_name"] = planned.zwo_name
-                        rematched = True
-                    except tp.NoCandidateWorkoutError:
-                        target["zwo_file"] = ""
-                        target["zwo_name"] = ""
-                        zwo_cleared = True
-                    except Exception:
-                        _log.exception("auto-adjust: today rematch swallowed")
-                    actions.append({
-                        "day": today_iso,
-                        "before": {"type": old_type, "duration_min": old_duration, "tss": old_tss},
-                        "after": {"type": new_type, "duration_min": new_duration, "tss": new_tss},
-                        "rematched": rematched,
-                        "zwo_cleared": zwo_cleared,
-                    })
-        else:  # scope == "week"
-            try:
-                # issue #3: on a SEVERE day (severity "rest" — e.g. high soreness
-                # forcing recovery) drop hard sessions ALL the way to easy in one
-                # pass, instead of one ladder step the rider has to repeat. A soft
-                # "tier_down" day still drops a single tier.
-                _to_floor = (severity == "rest")
-                wk_result = tp.apply_week_tier_down(
-                    working, today_iso, dry_run=dry_run, to_floor=_to_floor)
-                actions = wk_result.get("actions", [])
-                if wk_result.get("note"):
-                    note = wk_result["note"]
-            except Exception:
-                _log.exception("auto-adjust: apply_week_tier_down failed")
-                return JSONResponse({"error": "tier-down walk failed"}, 500)
+                old_duration = int(target.get("duration_min", 0) or 0)
+                old_tss = float(target.get("tss_estimate", 0) or 0)
+                target["session_type"] = "rest"
+                target["tss_estimate"] = 0
+                target["duration_min"] = 0
+                target["zwo_file"] = ""
+                target["zwo_name"] = ""
+                target["adapted"] = True
+                target["adapted_reason"] = "Auto-adjust: rest (severity=rest)"
+                target["status"] = "pending"
+                actions.append({
+                    "day": target_iso,
+                    "before": {"type": old_type, "duration_min": old_duration, "tss": old_tss},
+                    "after": {"type": "rest", "duration_min": 0, "tss": 0.0},
+                    "rematched": False,
+                    "zwo_cleared": True,
+                })
+            if scope == "week":
+                note = "week scope ignored for severity=rest; applies to today only"
 
-    # 7. Persist + reforecast on real (non-dry-run) paths only.
-    sessions_modified = 0 if dry_run else len(actions)
-    if not dry_run and actions:
-        try:
-            try:
-                activities = db.query_activities(days=120)
-            except Exception:
-                activities = []
-            try:
-                training_snap = cached("training", get_today_metrics)
-                current_tsb = training_snap.get("tsb")
-            except Exception:
-                current_tsb = None
-            tsb_series: "dict | None" = None
-            if current_tsb is not None:
-                tsb_series = {}
+        # 6. severity=tier_down.
+        elif severity == "tier_down":
+            if scope == "today":
+                # Walk today only — mirror apply-tier-down body inline so we
+                # share the dry-run path.
+                target = None
+                target_week = None
                 for w in working.get("weeks", []) or []:
-                    try:
-                        ws = date.fromisoformat(w["start"])
-                    except (KeyError, ValueError, TypeError):
-                        continue
-                    for i in range(7):
-                        tsb_series[ws + timedelta(days=i)] = current_tsb
-            avail = {
-                day_iso2: float(entry["hours"])
-                for day_iso2, entry in working.get("availability", {}).items()
-                if isinstance(entry, dict) and "hours" in entry
-            }
-            working, _modified, _ri = tp.reforecast_dict(
-                working,
-                today_iso=today_iso,
-                tsb_series=tsb_series,
-                recent_activities=activities,
-                availability_overrides=avail,
-            )
-        except Exception:
-            _log.exception("auto-adjust: reforecast skipped")
-        try:
-            tp.atomic_write_plan(json_path, working)
-        except Exception:
-            _log.exception("auto-adjust: atomic_write_plan failed")
-            return JSONResponse({"error": "plan write failed"}, 500)
+                    for s in w.get("sessions", []) or []:
+                        if s.get("day") == today_iso:
+                            target = s
+                            target_week = w
+                            break
+                    if target:
+                        break
+                if target is not None and target_week is not None:
+                    old_type = target.get("session_type", "") or ""
+                    if old_type in tp._HARD_SESSION_TYPES:
+                        new_type = tp._drop_intensity(old_type)
+                        old_duration = int(target.get("duration_min", 0) or 0)
+                        old_tss = float(target.get("tss_estimate", 0) or 0)
+                        new_duration, new_tss = tp._deescalated_load(
+                            old_duration, new_type, old_tss)
+                        target["session_type"] = new_type
+                        target["duration_min"] = new_duration
+                        target["tss_estimate"] = new_tss
+                        target["adapted"] = True
+                        target["adapted_reason"] = (
+                            f"Auto-adjust: {old_type} → {new_type} (severity=tier_down)"
+                        )
+                        target["status"] = "pending"
+                        rematched = False
+                        zwo_cleared = False
+                        try:
+                            library = tp.load_workout_library()
+                            planned = tp.PlannedSession(
+                                day=date.fromisoformat(today_iso),
+                                day_name=target.get("day_name", ""),
+                                session_type=new_type,
+                                # v3.6.0: match on the NEW duration. The tier-down
+                                # now trims duration to hold the load, so matching
+                                # on the old one attached a workout longer than the
+                                # session it was attached to.
+                                duration_min=new_duration,
+                                tss_estimate=new_tss,
+                                description=target.get("description", ""),
+                            )
+                            week_num = target_week.get("week_num", 0)
+                            try:
+                                day_idx = (date.fromisoformat(today_iso)
+                                           - date.fromisoformat(target_week["start"])).days
+                            except (KeyError, ValueError, TypeError):
+                                day_idx = 0
+                            old_zwo_name = target.get("zwo_name", "")
+                            excluded = {old_zwo_name} if old_zwo_name else set()
+                            tp.match_zwo(
+                                planned, library,
+                                week_num=week_num, day_idx=day_idx,
+                                used_names=excluded, raise_on_empty=True,
+                                hr_bias=_hr_bias(),
+                             micro_only=bool(((plan or {}).get("goal") or {}).get("vo2_microintervals_only", False)),)
+                            target["zwo_file"] = planned.zwo_file
+                            target["zwo_name"] = planned.zwo_name
+                            rematched = True
+                        except tp.NoCandidateWorkoutError:
+                            target["zwo_file"] = ""
+                            target["zwo_name"] = ""
+                            zwo_cleared = True
+                        except Exception:
+                            _log.exception("auto-adjust: today rematch swallowed")
+                        actions.append({
+                            "day": today_iso,
+                            "before": {"type": old_type, "duration_min": old_duration, "tss": old_tss},
+                            "after": {"type": new_type, "duration_min": new_duration, "tss": new_tss},
+                            "rematched": rematched,
+                            "zwo_cleared": zwo_cleared,
+                        })
+            else:  # scope == "week"
+                try:
+                    # issue #3: on a SEVERE day (severity "rest" — e.g. high soreness
+                    # forcing recovery) drop hard sessions ALL the way to easy in one
+                    # pass, instead of one ladder step the rider has to repeat. A soft
+                    # "tier_down" day still drops a single tier.
+                    _to_floor = (severity == "rest")
+                    wk_result = tp.apply_week_tier_down(
+                        working, today_iso, dry_run=dry_run, to_floor=_to_floor)
+                    actions = wk_result.get("actions", [])
+                    if wk_result.get("note"):
+                        note = wk_result["note"]
+                except Exception:
+                    _log.exception("auto-adjust: apply_week_tier_down failed")
+                    return JSONResponse({"error": "tier-down walk failed"}, 500)
+
+        # 7. Persist + reforecast on real (non-dry-run) paths only.
+        sessions_modified = 0 if dry_run else len(actions)
+        if not dry_run and actions:
+            try:
+                try:
+                    activities = db.query_activities(days=120)
+                except Exception:
+                    activities = []
+                try:
+                    training_snap = cached("training", get_today_metrics)
+                    current_tsb = training_snap.get("tsb")
+                except Exception:
+                    current_tsb = None
+                tsb_series: "dict | None" = None
+                if current_tsb is not None:
+                    tsb_series = {}
+                    for w in working.get("weeks", []) or []:
+                        try:
+                            ws = date.fromisoformat(w["start"])
+                        except (KeyError, ValueError, TypeError):
+                            continue
+                        for i in range(7):
+                            tsb_series[ws + timedelta(days=i)] = current_tsb
+                avail = {
+                    day_iso2: float(entry["hours"])
+                    for day_iso2, entry in working.get("availability", {}).items()
+                    if isinstance(entry, dict) and "hours" in entry
+                }
+                working, _modified, _ri = tp.reforecast_dict(
+                    working,
+                    today_iso=today_iso,
+                    tsb_series=tsb_series,
+                    recent_activities=activities,
+                    availability_overrides=avail,
+                )
+            except Exception:
+                _log.exception("auto-adjust: reforecast skipped")
+            try:
+                tp.atomic_write_plan(json_path, working)
+            except Exception:
+                _log.exception("auto-adjust: atomic_write_plan failed")
+                return JSONResponse({"error": "plan write failed"}, 500)
 
     # v1.8.9 Bug 9 (master §9/§10): `applied` is a bool — true iff the
     # persistence step actually changed the plan (i.e. not a dry-run AND
@@ -9515,50 +9517,51 @@ async def api_today_session_persist(request: Request):
             return JSONResponse({"error": "session_type required"}, 400)
 
         today_iso = clock.today().isoformat()
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
+        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
 
-        found = False
-        for w in plan.get("weeks", []):
-            for s in w.get("sessions", []):
-                if s.get("day") == today_iso:
-                    # The original prescription used to be OVERWRITTEN here,
-                    # which made "Ride the original anyway" unable to keep its
-                    # promise: the revert flag suppressed the live adjustment,
-                    # but every view reading the plan still showed the
-                    # persisted replacement — clicking looked like it did
-                    # nothing. Stash the pre-adapt session once (never
-                    # re-stash on a second adapt of the same day, or the true
-                    # original would be lost) so revert-cap can restore it.
-                    if not s.get("pre_adapt"):
-                        s["pre_adapt"] = {
-                            "session_type": s.get("session_type"),
-                            "duration_min": s.get("duration_min"),
-                            "tss_estimate": s.get("tss_estimate"),
-                            "description": s.get("description"),
-                            "zwo_file": s.get("zwo_file"),
-                            "zwo_name": s.get("zwo_name"),
-                        }
-                    s["session_type"] = new_type
-                    if body.get("duration_min") is not None:
-                        s["duration_min"] = int(body["duration_min"])
-                    if body.get("tss_estimate") is not None:
-                        s["tss_estimate"] = float(body["tss_estimate"])
-                    if body.get("description"):
-                        s["description"] = str(body["description"])
-                    s["adapted"] = True
-                    s["adapted_reason"] = reason
-                    # Clear ZWO so the UI / next match-pass re-picks for the new type.
-                    s["zwo_file"] = ""
-                    s["zwo_name"] = ""
-                    found = True
+            found = False
+            for w in plan.get("weeks", []):
+                for s in w.get("sessions", []):
+                    if s.get("day") == today_iso:
+                        # The original prescription used to be OVERWRITTEN here,
+                        # which made "Ride the original anyway" unable to keep its
+                        # promise: the revert flag suppressed the live adjustment,
+                        # but every view reading the plan still showed the
+                        # persisted replacement — clicking looked like it did
+                        # nothing. Stash the pre-adapt session once (never
+                        # re-stash on a second adapt of the same day, or the true
+                        # original would be lost) so revert-cap can restore it.
+                        if not s.get("pre_adapt"):
+                            s["pre_adapt"] = {
+                                "session_type": s.get("session_type"),
+                                "duration_min": s.get("duration_min"),
+                                "tss_estimate": s.get("tss_estimate"),
+                                "description": s.get("description"),
+                                "zwo_file": s.get("zwo_file"),
+                                "zwo_name": s.get("zwo_name"),
+                            }
+                        s["session_type"] = new_type
+                        if body.get("duration_min") is not None:
+                            s["duration_min"] = int(body["duration_min"])
+                        if body.get("tss_estimate") is not None:
+                            s["tss_estimate"] = float(body["tss_estimate"])
+                        if body.get("description"):
+                            s["description"] = str(body["description"])
+                        s["adapted"] = True
+                        s["adapted_reason"] = reason
+                        # Clear ZWO so the UI / next match-pass re-picks for the new type.
+                        s["zwo_file"] = ""
+                        s["zwo_name"] = ""
+                        found = True
+                        break
+                if found:
                     break
-            if found:
-                break
-        if not found:
-            return JSONResponse({"error": f"No session at {today_iso}"}, 404)
+            if not found:
+                return JSONResponse({"error": f"No session at {today_iso}"}, 404)
 
-        tp.atomic_write_plan(json_path, plan)
+            tp.atomic_write_plan(json_path, plan)
 
         return {"ok": True, "day": today_iso, "adapted_reason": reason,
                 "session_type": new_type}
@@ -10086,29 +10089,30 @@ async def api_continuous_deload_revert(request: Request):
     if not json_path.exists():
         return JSONResponse({"reverted": False, "reason": "no_plan"}, 404)
     try:
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
-        rec = plan.get("deload_advance") or {}
-        if not rec or rec.get("reverted"):
-            return {"reverted": False, "reason": "nothing_to_revert"}
-        today = clock.today()
-        orig = rec.get("original_week") or {}
-        wj = next((w for w in plan.get("weeks", [])
-                   if w.get("week_num") == rec.get("week_num")), None)
-        if wj is None or (wj.get("end") or "") < today.isoformat():
-            return {"reverted": False, "reason": "week_passed"}
-        by_day = {s.get("day"): s for s in orig.get("sessions", [])}
-        wj["sessions"] = [
-            (by_day.get(sj.get("day"), sj)
-             if (sj.get("day") or "") >= today.isoformat() else sj)
-            for sj in wj.get("sessions", [])
-        ]
-        wj["is_stepback"] = bool(orig.get("is_stepback", False))
-        wj["tss_target"] = orig.get("tss_target", wj.get("tss_target"))
-        rec["reverted"] = True
-        rec["reverted_on"] = today.isoformat()
-        plan["deload_advance"] = rec
-        tp.atomic_write_plan(json_path, plan)
+        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
+            rec = plan.get("deload_advance") or {}
+            if not rec or rec.get("reverted"):
+                return {"reverted": False, "reason": "nothing_to_revert"}
+            today = clock.today()
+            orig = rec.get("original_week") or {}
+            wj = next((w for w in plan.get("weeks", [])
+                       if w.get("week_num") == rec.get("week_num")), None)
+            if wj is None or (wj.get("end") or "") < today.isoformat():
+                return {"reverted": False, "reason": "week_passed"}
+            by_day = {s.get("day"): s for s in orig.get("sessions", [])}
+            wj["sessions"] = [
+                (by_day.get(sj.get("day"), sj)
+                 if (sj.get("day") or "") >= today.isoformat() else sj)
+                for sj in wj.get("sessions", [])
+            ]
+            wj["is_stepback"] = bool(orig.get("is_stepback", False))
+            wj["tss_target"] = orig.get("tss_target", wj.get("tss_target"))
+            rec["reverted"] = True
+            rec["reverted_on"] = today.isoformat()
+            plan["deload_advance"] = rec
+            tp.atomic_write_plan(json_path, plan)
         _log.info(f"EVENT=continuous_deload_reverted week={rec.get('week_num')}")
         return {"reverted": True, "week_num": rec.get("week_num")}
     except Exception:
@@ -11330,186 +11334,187 @@ async def api_plan_generate(request: Request):
         availability_overrides: dict[str, float] = {}
         old_availability_full: dict = {}  # v1.8.21 — keep type info for block-preserve
         _existing_plan = None
-        if json_path.exists():
-            try:
-                with open(json_path, encoding="utf-8") as f:
-                    _existing_plan = json.load(f)
-                old_availability_full = _existing_plan.get("availability", {}) or {}
-                availability_overrides = {
-                    day_iso: float(entry["hours"])
-                    for day_iso, entry in old_availability_full.items()
-                    if isinstance(entry, dict) and "hours" in entry
-                    and entry.get("type") in _EXPLICIT_BLOCK
-                }
-            except (json.JSONDecodeError, OSError, KeyError, ValueError, TypeError):
-                availability_overrides = {}
-                old_availability_full = {}
+        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+            if json_path.exists():
+                try:
+                    with open(json_path, encoding="utf-8") as f:
+                        _existing_plan = json.load(f)
+                    old_availability_full = _existing_plan.get("availability", {}) or {}
+                    availability_overrides = {
+                        day_iso: float(entry["hours"])
+                        for day_iso, entry in old_availability_full.items()
+                        if isinstance(entry, dict) and "hours" in entry
+                        and entry.get("type") in _EXPLICIT_BLOCK
+                    }
+                except (json.JSONDecodeError, OSError, KeyError, ValueError, TypeError):
+                    availability_overrides = {}
+                    old_availability_full = {}
 
-        # v1.11.0 — thread athlete (ftp + weight) so the event-demand planner
-        # can compute event targets.
-        athlete = _planner_athlete()
+            # v1.11.0 — thread athlete (ftp + weight) so the event-demand planner
+            # can compute event targets.
+            athlete = _planner_athlete()
 
-        # v2.1.0 (F5 + E1) — thread the rider's ACTUAL starting fitness + recent
-        # load into INITIAL generation. Pre-fix, generate_plan self-fetched CTL
-        # and defaulted to 37.0 ("starts like post-winter"), and the volume
-        # ceiling came from availability. Now we pass the real current_ctl (ICU
-        # wellness; generate_plan still falls back to local-CTL→37 when None,
-        # preserving F4) and the recent mean weekly TSS from the full local
-        # archive (sets the load-based weekly ceiling). Mirrors the adaptation
-        # path's `cached("training", get_today_metrics)` + current_ctl read.
-        current_ctl = None
-        recent_weekly_tss = None
-        try:
-            training = cached("training", get_today_metrics)
-            current_ctl = _fitness_state()["ctl"]     # None: the planner's own fallback
-        except Exception:
+            # v2.1.0 (F5 + E1) — thread the rider's ACTUAL starting fitness + recent
+            # load into INITIAL generation. Pre-fix, generate_plan self-fetched CTL
+            # and defaulted to 37.0 ("starts like post-winter"), and the volume
+            # ceiling came from availability. Now we pass the real current_ctl (ICU
+            # wellness; generate_plan still falls back to local-CTL→37 when None,
+            # preserving F4) and the recent mean weekly TSS from the full local
+            # archive (sets the load-based weekly ceiling). Mirrors the adaptation
+            # path's `cached("training", get_today_metrics)` + current_ctl read.
             current_ctl = None
-        recent_weekly_tss = _chronic_weekly_tss_safe()
+            recent_weekly_tss = None
+            try:
+                training = cached("training", get_today_metrics)
+                current_ctl = _fitness_state()["ctl"]     # None: the planner's own fallback
+            except Exception:
+                current_ctl = None
+            recent_weekly_tss = _chronic_weekly_tss_safe()
 
-        # Re-entry shaping inputs (SCIENCE.md "Returning after a break"):
-        # how long since the last ride, and TSB now. Best-effort — None keeps
-        # generate_plan's legacy behaviour.
-        days_since_last_ride = None
-        tsb_at_generation = None
-        try:
-            import ride_storage as _rs2
-            from datetime import date as _date
-            last = max((r.get("started_at") or "")[:10]
-                       for r in _rs2.load_all_rides())
-            if last:
-                days_since_last_ride = (clock.today()
-                                        - _date.fromisoformat(last)).days
-        except Exception:
+            # Re-entry shaping inputs (SCIENCE.md "Returning after a break"):
+            # how long since the last ride, and TSB now. Best-effort — None keeps
+            # generate_plan's legacy behaviour.
             days_since_last_ride = None
-        try:
-            tsb_at_generation = training.get("tsb")
-        except Exception:
             tsb_at_generation = None
+            try:
+                import ride_storage as _rs2
+                from datetime import date as _date
+                last = max((r.get("started_at") or "")[:10]
+                           for r in _rs2.load_all_rides())
+                if last:
+                    days_since_last_ride = (clock.today()
+                                            - _date.fromisoformat(last)).days
+            except Exception:
+                days_since_last_ride = None
+            try:
+                tsb_at_generation = training.get("tsb")
+            except Exception:
+                tsb_at_generation = None
 
-        phases, weeks = tp.generate_plan(
-            goal, seed_salt=seed_salt,
-            availability_overrides=availability_overrides or None,
-            athlete=athlete,
-            current_ctl=current_ctl,
-            recent_weekly_tss=recent_weekly_tss,
-            days_since_last_ride=days_since_last_ride,
-            tsb_at_generation=tsb_at_generation,
-            # A plan generated mid-week overlaps days already ridden. Without
-            # these, "generate" hands the rider a fresh week on top of the one
-            # they are in.
-            activities=_recent_activities_for_planner(),
-        )
-        plan_path = tp.export_plan_md(goal, phases, weeks)
-
-        # Also save structured JSON
-        plan_dict = {
-            # Through the codec: every Goal field, under the names the goal
-            # block has always used.
-            "goal": tp.goal_to_dict(goal),
-            "phases": [
-                {
-                    "name": p.name,
-                    "weeks": p.weeks,
-                    "start": p.start.isoformat() if hasattr(p.start, "isoformat") else str(p.start),
-                    "end": p.end.isoformat() if hasattr(p.end, "isoformat") else str(p.end),
-                    "weekly_tss": p.weekly_tss_target,
-                    "focus": p.focus,
-                }
-                for p in phases
-            ],
-            # Through the codec: every week and session field. This writer
-            # kept 11 of a session's 27, so fuelling notes, matched=False and
-            # the double-threshold pairing were lost at birth, and so was the
-            # week's own budget (dupes.md DUP-25, http.md HTTP-9).
-            "weeks": [tp.week_to_dict(w) for w in weeks],
-            "generated": clock.now().isoformat(),
-            # P4.2 (v3.0.0) — generation-time fitness snapshot for the
-            # Training-Plan-tab drift chip (live CTL vs plan assumption).
-            "ctl_snapshot": tp.plan_ctl_snapshot(current_ctl, recent_weekly_tss),
-        }
-
-        # v1.8.21 — rebuild the per-day availability calendar from the NEWLY
-        # chosen weekly hours so it reflects them across the whole plan span.
-        # Pre-fix /api/plan/generate carried the OLD plan["availability"]
-        # verbatim (v1.3.2), so after changing weekday/weekend hours the
-        # calendar still showed the old per-day values: the calendar is DENSE,
-        # so the frontend's weekly-grid default-fill (loadAvailData, only fills
-        # days NOT already present) was skipped for every already-stored day →
-        # stale hours always won. Now: every day in the plan span is set to the
-        # new weekly default (goal.daily_max_hours per weekday, else
-        # max_weekday/weekend, rest_days → 0), EXCEPT days the user explicitly
-        # blocked (holiday / injury / illness / unavailable), which are kept.
-        # (_EXPLICIT_BLOCK defined once above, where the same set gates which
-        # old rows are fed to generate_plan — 3.3.3 keeps both in lockstep.)
-        _daily = goal.daily_max_hours or {}
-
-        def _default_hours_for_weekday(wd: int) -> float:
-            if wd in (goal.rest_days or []):
-                return 0.0
-            if wd in _daily:
-                return float(_daily[wd])
-            return float(goal.max_weekend_hours if wd >= 5 else goal.max_weekday_hours)
-
-        if weeks:
-            _new_avail: dict = {}
-            _d = weeks[0].start
-            # PART B (B-LOCKED-1 availability span): on a backdated plan the
-            # calendar starts TODAY — elapsed days are not schedulable, so
-            # they carry no availability rows. Fresh plans start today anyway.
-            if getattr(goal, "start_date", None) and _d < clock.today():
-                _d = clock.today()
-            _end = weeks[-1].end
-            _one = timedelta(days=1)
-            while _d <= _end:
-                _key = _d.isoformat()
-                _old = old_availability_full.get(_key)
-                if isinstance(_old, dict) and _old.get("type") in _EXPLICIT_BLOCK:
-                    _new_avail[_key] = _old  # preserve explicit holiday/injury/illness
-                else:
-                    _h = _default_hours_for_weekday(_d.weekday())
-                    _new_avail[_key] = {"hours": _h,
-                                        "type": "available" if _h > 0 else "rest"}
-                _d += _one
-            plan_dict["availability"] = _new_avail
-
-        # What the rider was prescribed before this plan stays on record
-        # (week-view contract P4, A5): the calendar's history rows and the
-        # Last-week card read it through the week view.
-        if weeks and isinstance(_existing_plan, dict):
-            _replaced = _replaced_weeks_before(
-                _existing_plan, min(min(w.start for w in weeks), clock.today()))
-            if _replaced:
-                plan_dict["replaced_weeks"] = _replaced
-
-        # v2.3.0 — realized training-type distribution (honest, computed from the
-        # generated sessions) for the UI's "% distribution" readout.
-        plan_dict["realized_bands"] = tp.realized_band_distribution(plan_dict)
-
-        # Phase-split editor (v3.2.0, A1): stamp plan meta with what actually
-        # happened to the requested split — "applied" | "fallback:<reason>".
-        # The UI badge reads THIS, not the goal (a stored split that fell
-        # back must not masquerade as applied).
-        _pw_status = (getattr(goal, "_phase_weeks_status", None)
-                      or (f"fallback:{_pw_parse_err}" if _pw_parse_err else None))
-        if _pw_status:
-            plan_dict["phase_weeks_status"] = _pw_status
-
-        # F4c (v2.5.0, D4): a <14-day runway generates a race-week-only
-        # MICRO-PLAN (single taper phase — see tp.generate_phases): rest,
-        # openers, race; at most one hard touch. Surface a warning in the plan
-        # payload so the UI can explain the shape instead of the user
-        # wondering where the training block went. Detected via the phase
-        # shape (the planner's decision), not a second clock read.
-        if (goal.goal_type in ("event", "ctl") and goal.target_date
-                and len(phases) == 1 and phases[0].name == "taper"):
-            plan_dict["warning"] = (
-                f"{goal.event_name or 'Your event'} is under two weeks away — "
-                "this is a race-week plan (rest, openers, race), not a "
-                "training block. Fitness for the event is already set; "
-                "arriving fresh is what's left to win."
+            phases, weeks = tp.generate_plan(
+                goal, seed_salt=seed_salt,
+                availability_overrides=availability_overrides or None,
+                athlete=athlete,
+                current_ctl=current_ctl,
+                recent_weekly_tss=recent_weekly_tss,
+                days_since_last_ride=days_since_last_ride,
+                tsb_at_generation=tsb_at_generation,
+                # A plan generated mid-week overlaps days already ridden. Without
+                # these, "generate" hands the rider a fresh week on top of the one
+                # they are in.
+                activities=_recent_activities_for_planner(),
             )
+            plan_path = tp.export_plan_md(goal, phases, weeks)
 
-        tp.atomic_write_plan(json_path, plan_dict)
+            # Also save structured JSON
+            plan_dict = {
+                # Through the codec: every Goal field, under the names the goal
+                # block has always used.
+                "goal": tp.goal_to_dict(goal),
+                "phases": [
+                    {
+                        "name": p.name,
+                        "weeks": p.weeks,
+                        "start": p.start.isoformat() if hasattr(p.start, "isoformat") else str(p.start),
+                        "end": p.end.isoformat() if hasattr(p.end, "isoformat") else str(p.end),
+                        "weekly_tss": p.weekly_tss_target,
+                        "focus": p.focus,
+                    }
+                    for p in phases
+                ],
+                # Through the codec: every week and session field. This writer
+                # kept 11 of a session's 27, so fuelling notes, matched=False and
+                # the double-threshold pairing were lost at birth, and so was the
+                # week's own budget (dupes.md DUP-25, http.md HTTP-9).
+                "weeks": [tp.week_to_dict(w) for w in weeks],
+                "generated": clock.now().isoformat(),
+                # P4.2 (v3.0.0) — generation-time fitness snapshot for the
+                # Training-Plan-tab drift chip (live CTL vs plan assumption).
+                "ctl_snapshot": tp.plan_ctl_snapshot(current_ctl, recent_weekly_tss),
+            }
+
+            # v1.8.21 — rebuild the per-day availability calendar from the NEWLY
+            # chosen weekly hours so it reflects them across the whole plan span.
+            # Pre-fix /api/plan/generate carried the OLD plan["availability"]
+            # verbatim (v1.3.2), so after changing weekday/weekend hours the
+            # calendar still showed the old per-day values: the calendar is DENSE,
+            # so the frontend's weekly-grid default-fill (loadAvailData, only fills
+            # days NOT already present) was skipped for every already-stored day →
+            # stale hours always won. Now: every day in the plan span is set to the
+            # new weekly default (goal.daily_max_hours per weekday, else
+            # max_weekday/weekend, rest_days → 0), EXCEPT days the user explicitly
+            # blocked (holiday / injury / illness / unavailable), which are kept.
+            # (_EXPLICIT_BLOCK defined once above, where the same set gates which
+            # old rows are fed to generate_plan — 3.3.3 keeps both in lockstep.)
+            _daily = goal.daily_max_hours or {}
+
+            def _default_hours_for_weekday(wd: int) -> float:
+                if wd in (goal.rest_days or []):
+                    return 0.0
+                if wd in _daily:
+                    return float(_daily[wd])
+                return float(goal.max_weekend_hours if wd >= 5 else goal.max_weekday_hours)
+
+            if weeks:
+                _new_avail: dict = {}
+                _d = weeks[0].start
+                # PART B (B-LOCKED-1 availability span): on a backdated plan the
+                # calendar starts TODAY — elapsed days are not schedulable, so
+                # they carry no availability rows. Fresh plans start today anyway.
+                if getattr(goal, "start_date", None) and _d < clock.today():
+                    _d = clock.today()
+                _end = weeks[-1].end
+                _one = timedelta(days=1)
+                while _d <= _end:
+                    _key = _d.isoformat()
+                    _old = old_availability_full.get(_key)
+                    if isinstance(_old, dict) and _old.get("type") in _EXPLICIT_BLOCK:
+                        _new_avail[_key] = _old  # preserve explicit holiday/injury/illness
+                    else:
+                        _h = _default_hours_for_weekday(_d.weekday())
+                        _new_avail[_key] = {"hours": _h,
+                                            "type": "available" if _h > 0 else "rest"}
+                    _d += _one
+                plan_dict["availability"] = _new_avail
+
+            # What the rider was prescribed before this plan stays on record
+            # (week-view contract P4, A5): the calendar's history rows and the
+            # Last-week card read it through the week view.
+            if weeks and isinstance(_existing_plan, dict):
+                _replaced = _replaced_weeks_before(
+                    _existing_plan, min(min(w.start for w in weeks), clock.today()))
+                if _replaced:
+                    plan_dict["replaced_weeks"] = _replaced
+
+            # v2.3.0 — realized training-type distribution (honest, computed from the
+            # generated sessions) for the UI's "% distribution" readout.
+            plan_dict["realized_bands"] = tp.realized_band_distribution(plan_dict)
+
+            # Phase-split editor (v3.2.0, A1): stamp plan meta with what actually
+            # happened to the requested split — "applied" | "fallback:<reason>".
+            # The UI badge reads THIS, not the goal (a stored split that fell
+            # back must not masquerade as applied).
+            _pw_status = (getattr(goal, "_phase_weeks_status", None)
+                          or (f"fallback:{_pw_parse_err}" if _pw_parse_err else None))
+            if _pw_status:
+                plan_dict["phase_weeks_status"] = _pw_status
+
+            # F4c (v2.5.0, D4): a <14-day runway generates a race-week-only
+            # MICRO-PLAN (single taper phase — see tp.generate_phases): rest,
+            # openers, race; at most one hard touch. Surface a warning in the plan
+            # payload so the UI can explain the shape instead of the user
+            # wondering where the training block went. Detected via the phase
+            # shape (the planner's decision), not a second clock read.
+            if (goal.goal_type in ("event", "ctl") and goal.target_date
+                    and len(phases) == 1 and phases[0].name == "taper"):
+                plan_dict["warning"] = (
+                    f"{goal.event_name or 'Your event'} is under two weeks away — "
+                    "this is a race-week plan (rest, openers, race), not a "
+                    "training block. Fitness for the event is already set; "
+                    "arriving fresh is what's left to win."
+                )
+
+            tp.atomic_write_plan(json_path, plan_dict)
 
         # v1.4.0 — single enrichment helper (replaces the inline duplicate).
         # Adds card_state / card_state_v2 / content_class / display_name /
@@ -11621,15 +11626,16 @@ def _maybe_auto_reforecast(profile_id: str, new_rides: int) -> "str | None":
             # Only the daily stamp landed when the reforecast debounced: nothing
             # the cards show changed, so nothing to repaint.
             written = action if action != "skipped" else None
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
-        if _plan_is_continuous(plan):
-            try:
-                if _maybe_advance_continuous_deload(plan, json_path) and plan.get(
-                        "deload_advance", {}).get("advanced_on") == clock.today().isoformat():
-                    written = "deload_advanced"
-            except Exception as _e:  # noqa: BLE001
-                _log.warning(f"continuous deload check failed: {_e}")
+        with tp.plan_write_lock():  # #32: the deload advance re-reads and writes the plan
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
+            if _plan_is_continuous(plan):
+                try:
+                    if _maybe_advance_continuous_deload(plan, json_path) and plan.get(
+                            "deload_advance", {}).get("advanced_on") == clock.today().isoformat():
+                        written = "deload_advanced"
+                except Exception as _e:  # noqa: BLE001
+                    _log.warning(f"continuous deload check failed: {_e}")
     except Exception as e:  # noqa: BLE001
         _log.warning(f"auto-adapt skipped: {e}")
     return written
@@ -11643,112 +11649,113 @@ async def api_plan_reforecast():
         return JSONResponse({"error": "No active plan found"}, 404)
 
     try:
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
+        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
 
-        # Get actual training data from SQLite
-        activities = db.query_activities(days=120)
+            # Get actual training data from SQLite
+            activities = db.query_activities(days=120)
 
-        # Build weekly actual TSS from activities
-        actual_weekly = {}
-        for a in activities:
-            if not a.get("date") or not a.get("tss"):
-                continue
-            # Find which plan week this activity falls in
-            act_date = a["date"]
-            for w in plan.get("weeks", []):
-                if w["start"] <= act_date <= w["end"]:
-                    wk = w["week_num"]
-                    actual_weekly[wk] = actual_weekly.get(wk, 0) + (a["tss"] or 0)
-                    break
-
-        # Annotate weeks with actual data
-        today_str = clock.today().isoformat()
-        for w in plan.get("weeks", []):
-            wk = w["week_num"]
-            w["actual_tss"] = round(actual_weekly.get(wk, 0), 1)
-            w["is_past"] = w["end"] < today_str
-            w["is_current"] = w["start"] <= today_str <= w["end"]
-            if w["is_past"] and w["tss_target"]:
-                diff_pct = (w["actual_tss"] - w["tss_target"]) / w["tss_target"] * 100 if w["tss_target"] else 0
-                w["adherence_pct"] = round(diff_pct, 1)
-
-        # P2 (v4.1.0) — actually call tp.reforecast() so TSB-triggered
-        # future-session downshifts land on disk. Previously this endpoint
-        # only annotated actual_tss + surfaced gaps; the "Reforecast" UI
-        # button was a silent no-op for intensity.
-        training = cached("training", get_today_metrics)
-        current_ctl = _planning_ctl()
-        current_tsb = training.get("tsb")
-
-        # Flat-TSB projection for every future day unless ICU gives us more.
-        # v1.5.0 — keyed by date, computed from plan["weeks"][*]["start"].
-        tsb_series = None
-        if current_tsb is not None:
-            tsb_series = {}
-            for w in plan.get("weeks", []) or []:
-                try:
-                    ws = date.fromisoformat(w["start"])
-                except (KeyError, ValueError, TypeError):
+            # Build weekly actual TSS from activities
+            actual_weekly = {}
+            for a in activities:
+                if not a.get("date") or not a.get("tss"):
                     continue
-                for i in range(7):
-                    tsb_series[ws + timedelta(days=i)] = current_tsb
+                # Find which plan week this activity falls in
+                act_date = a["date"]
+                for w in plan.get("weeks", []):
+                    if w["start"] <= act_date <= w["end"]:
+                        wk = w["week_num"]
+                        actual_weekly[wk] = actual_weekly.get(wk, 0) + (a["tss"] or 0)
+                        break
 
-        # v4.6.6 WAVE-4-FIX CRITICAL-3: pass recent_activities (G4 ACWR,
-        # Gabbett 2016) and current/target polarization (G3 breach,
-        # Seiler/Stöggl/Treff) to reforecast(). Pre-fix the UI Reforecast
-        # button computed acwr_ratio against an empty list → G4 dead; G3
-        # branch never had inputs → polarization breach never fired.
-        try:
-            today_d = clock.today()
-            actual_pol_kwarg = _polarized_actual_from_rides(
-                _load_all_rides_safe(), today_d, last_n_days=7,
+            # Annotate weeks with actual data
+            today_str = clock.today().isoformat()
+            for w in plan.get("weeks", []):
+                wk = w["week_num"]
+                w["actual_tss"] = round(actual_weekly.get(wk, 0), 1)
+                w["is_past"] = w["end"] < today_str
+                w["is_current"] = w["start"] <= today_str <= w["end"]
+                if w["is_past"] and w["tss_target"]:
+                    diff_pct = (w["actual_tss"] - w["tss_target"]) / w["tss_target"] * 100 if w["tss_target"] else 0
+                    w["adherence_pct"] = round(diff_pct, 1)
+
+            # P2 (v4.1.0) — actually call tp.reforecast() so TSB-triggered
+            # future-session downshifts land on disk. Previously this endpoint
+            # only annotated actual_tss + surfaced gaps; the "Reforecast" UI
+            # button was a silent no-op for intensity.
+            training = cached("training", get_today_metrics)
+            current_ctl = _planning_ctl()
+            current_tsb = training.get("tsb")
+
+            # Flat-TSB projection for every future day unless ICU gives us more.
+            # v1.5.0 — keyed by date, computed from plan["weeks"][*]["start"].
+            tsb_series = None
+            if current_tsb is not None:
+                tsb_series = {}
+                for w in plan.get("weeks", []) or []:
+                    try:
+                        ws = date.fromisoformat(w["start"])
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    for i in range(7):
+                        tsb_series[ws + timedelta(days=i)] = current_tsb
+
+            # v4.6.6 WAVE-4-FIX CRITICAL-3: pass recent_activities (G4 ACWR,
+            # Gabbett 2016) and current/target polarization (G3 breach,
+            # Seiler/Stöggl/Treff) to reforecast(). Pre-fix the UI Reforecast
+            # button computed acwr_ratio against an empty list → G4 dead; G3
+            # branch never had inputs → polarization breach never fired.
+            try:
+                today_d = clock.today()
+                actual_pol_kwarg = _polarized_actual_from_rides(
+                    _load_all_rides_safe(), today_d, last_n_days=7,
+                )
+            except Exception:  # noqa: BLE001
+                actual_pol_kwarg = None
+            try:
+                today_iso_str = today_d.isoformat()
+                cur_phase = next(
+                    (w.get("phase", "") for w in plan.get("weeks", []) or []
+                     if (w.get("start", "") or "") <= today_iso_str <= (w.get("end", "") or "")),
+                    None,
+                )
+                # J1 (v2.1.0): judge the breach gate against the plan's OWN
+                # distribution model, so a pyramidal/threshold plan isn't held to
+                # the polarized ceiling.
+                _model_targets = tp.polarized_targets(plan.get("goal", {}) or {})
+                target_pol_kwarg = _model_targets.get(
+                    (cur_phase or "").lower(), _model_targets.get("history"))
+            except Exception:  # noqa: BLE001
+                target_pol_kwarg = None
+
+            # v1.0.3 — plumb plan["availability"] into reforecast so per-day
+            # hour overrides actually rescale daily duration / TSS. Sparse:
+            # only days the user touched are in the dict; absent days keep
+            # current planned duration.
+            availability_overrides = {
+                day_iso: float(entry["hours"])
+                for day_iso, entry in plan.get("availability", {}).items()
+                if isinstance(entry, dict) and "hours" in entry
+            }
+
+            # v1.5.0 — single-layer reforecast. Replaces the inline PlannedWeek
+            # build + tp.reforecast() call + the v1.4.0 propagation helper.
+            # Single mutation site (drift class A closure).
+            plan, sessions_changed, reforecast_info = tp.reforecast_dict(
+                plan,
+                today_iso=today_iso_str,
+                tsb_series=tsb_series,
+                recent_activities=activities,
+                actual_polarization=actual_pol_kwarg,
+                target_polarization=target_pol_kwarg,
+                availability_overrides=availability_overrides,
             )
-        except Exception:  # noqa: BLE001
-            actual_pol_kwarg = None
-        try:
-            today_iso_str = today_d.isoformat()
-            cur_phase = next(
-                (w.get("phase", "") for w in plan.get("weeks", []) or []
-                 if (w.get("start", "") or "") <= today_iso_str <= (w.get("end", "") or "")),
-                None,
-            )
-            # J1 (v2.1.0): judge the breach gate against the plan's OWN
-            # distribution model, so a pyramidal/threshold plan isn't held to
-            # the polarized ceiling.
-            _model_targets = tp.polarized_targets(plan.get("goal", {}) or {})
-            target_pol_kwarg = _model_targets.get(
-                (cur_phase or "").lower(), _model_targets.get("history"))
-        except Exception:  # noqa: BLE001
-            target_pol_kwarg = None
 
-        # v1.0.3 — plumb plan["availability"] into reforecast so per-day
-        # hour overrides actually rescale daily duration / TSS. Sparse:
-        # only days the user touched are in the dict; absent days keep
-        # current planned duration.
-        availability_overrides = {
-            day_iso: float(entry["hours"])
-            for day_iso, entry in plan.get("availability", {}).items()
-            if isinstance(entry, dict) and "hours" in entry
-        }
-
-        # v1.5.0 — single-layer reforecast. Replaces the inline PlannedWeek
-        # build + tp.reforecast() call + the v1.4.0 propagation helper.
-        # Single mutation site (drift class A closure).
-        plan, sessions_changed, reforecast_info = tp.reforecast_dict(
-            plan,
-            today_iso=today_iso_str,
-            tsb_series=tsb_series,
-            recent_activities=activities,
-            actual_polarization=actual_pol_kwarg,
-            target_polarization=target_pol_kwarg,
-            availability_overrides=availability_overrides,
-        )
-
-        # Save updated plan
-        plan["reforecast_date"] = clock.now().isoformat()
-        plan["last_reforecast_info"] = reforecast_info
-        tp.atomic_write_plan(json_path, plan)
+            # Save updated plan
+            plan["reforecast_date"] = clock.now().isoformat()
+            plan["last_reforecast_info"] = reforecast_info
+            tp.atomic_write_plan(json_path, plan)
 
         # Also detect gaps (tiered absence detection). v1.5.0: rebuild
         # pw_list from the (now-mutated) plan dict — the previous local
@@ -11784,30 +11791,31 @@ async def api_mark_unavailable(request: Request):
         return JSONResponse({"error": "No active plan found"}, 404)
 
     try:
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
+        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
 
-        period = {
-            "start": body.get("start"),
-            "end": body.get("end"),
-            "type": body.get("type", "holiday"),  # holiday, injury, illness
-            "daily_tss": body.get("daily_tss", 0),
-            "reason": body.get("reason", ""),
-        }
+            period = {
+                "start": body.get("start"),
+                "end": body.get("end"),
+                "type": body.get("type", "holiday"),  # holiday, injury, illness
+                "daily_tss": body.get("daily_tss", 0),
+                "reason": body.get("reason", ""),
+            }
 
-        if not period["start"] or not period["end"]:
-            return JSONResponse({"error": "start and end dates required"}, 400)
-        try:
-            date.fromisoformat(period["start"])
-            date.fromisoformat(period["end"])
-        except (ValueError, TypeError):
-            return JSONResponse({"error": "Invalid date format (use YYYY-MM-DD)"}, 400)
+            if not period["start"] or not period["end"]:
+                return JSONResponse({"error": "start and end dates required"}, 400)
+            try:
+                date.fromisoformat(period["start"])
+                date.fromisoformat(period["end"])
+            except (ValueError, TypeError):
+                return JSONResponse({"error": "Invalid date format (use YYYY-MM-DD)"}, 400)
 
-        unavailable = plan.get("unavailable_periods", [])
-        unavailable.append(period)
-        plan["unavailable_periods"] = unavailable
+            unavailable = plan.get("unavailable_periods", [])
+            unavailable.append(period)
+            plan["unavailable_periods"] = unavailable
 
-        tp.atomic_write_plan(json_path, plan)
+            tp.atomic_write_plan(json_path, plan)
 
         return {"ok": True, "period": period, "plan_json": plan}
 
@@ -11833,108 +11841,109 @@ async def api_save_availability(request: Request):
         return JSONResponse({"error": "No active plan found"}, 404)
 
     try:
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
+        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
 
-        # body = { "availability": { "2026-04-01": { "hours": 1.5, "type": "available" }, ... } }
-        # v1.7.3 — capture prior availability BEFORE overwriting so we can
-        # diff incoming vs old and feed only USER-CHANGED days into the
-        # reforecast scaler. Pre-v1.7.3 the frontend POSTed every day in
-        # the visible calendar (180 days of weekly-grid defaults), so the
-        # scaling loop saw the entire window as "overrides" and (a)
-        # diluted the targeted day's effect (b) couldn't tell user-intent
-        # from auto-fill. v1.7.1 patched the dilution via per-day cap,
-        # but the cap is one-way (shrink only) so once a session was
-        # capped down the user could not raise it back up — they reported
-        # "0 sessions changed" on subsequent updates.
-        prior_availability = plan.get("availability", {}) or {}
-        new_availability = body.get("availability", {}) or {}
-        plan["availability"] = new_availability
+            # body = { "availability": { "2026-04-01": { "hours": 1.5, "type": "available" }, ... } }
+            # v1.7.3 — capture prior availability BEFORE overwriting so we can
+            # diff incoming vs old and feed only USER-CHANGED days into the
+            # reforecast scaler. Pre-v1.7.3 the frontend POSTed every day in
+            # the visible calendar (180 days of weekly-grid defaults), so the
+            # scaling loop saw the entire window as "overrides" and (a)
+            # diluted the targeted day's effect (b) couldn't tell user-intent
+            # from auto-fill. v1.7.1 patched the dilution via per-day cap,
+            # but the cap is one-way (shrink only) so once a session was
+            # capped down the user could not raise it back up — they reported
+            # "0 sessions changed" on subsequent updates.
+            prior_availability = plan.get("availability", {}) or {}
+            new_availability = body.get("availability", {}) or {}
+            plan["availability"] = new_availability
 
-        def _hours_of(entry: "dict | None") -> "float | None":
-            if not isinstance(entry, dict):
-                return None
-            h = entry.get("hours")
+            def _hours_of(entry: "dict | None") -> "float | None":
+                if not isinstance(entry, dict):
+                    return None
+                h = entry.get("hours")
+                try:
+                    return float(h) if h is not None else None
+                except (TypeError, ValueError):
+                    return None
+
+            # ── v1.3.1 HIGH fix: reflow plan immediately ──────────────────────
+            # v1.5.0 — collapsed into tp.reforecast_dict.
+            # v1.7.1 — also pass tsb_series + recent_activities so downstream
+            # G3 / TSB-based downshifts actually fire after an availability
+            # change. Pre-v1.7.1 these were both empty (v1.3.3 perf trade-off
+            # against 2× ICU HTTPS per future hard session). v1.6.3 moved ICU
+            # sync off the request thread, and ``cached("training", ...)``
+            # serves the local snapshot in ~ms, so the perf concern no longer
+            # justifies dropping downstream propagation.
+            sessions_modified = 0
             try:
-                return float(h) if h is not None else None
-            except (TypeError, ValueError):
-                return None
-
-        # ── v1.3.1 HIGH fix: reflow plan immediately ──────────────────────
-        # v1.5.0 — collapsed into tp.reforecast_dict.
-        # v1.7.1 — also pass tsb_series + recent_activities so downstream
-        # G3 / TSB-based downshifts actually fire after an availability
-        # change. Pre-v1.7.1 these were both empty (v1.3.3 perf trade-off
-        # against 2× ICU HTTPS per future hard session). v1.6.3 moved ICU
-        # sync off the request thread, and ``cached("training", ...)``
-        # serves the local snapshot in ~ms, so the perf concern no longer
-        # justifies dropping downstream propagation.
-        sessions_modified = 0
-        try:
-            # v1.7.3 — only feed CHANGED days into the scaler. A day's
-            # ``hours`` value must differ from the prior plan's entry
-            # (or be new) to count as user intent. Days the frontend
-            # auto-filled with the weekly-grid default never enter the
-            # override set, so they keep the planner's existing duration
-            # untouched.
-            availability_overrides: dict[str, float] = {}
-            for day_iso, entry in new_availability.items():
-                new_h = _hours_of(entry)
-                if new_h is None:
-                    continue
-                old_h = _hours_of(prior_availability.get(day_iso))
-                if old_h is None or abs(new_h - old_h) > 1e-6:
-                    availability_overrides[day_iso] = new_h
-            if not availability_overrides:
-                # No user edits → nothing to reflow. Persist the new
-                # availability dict (might carry type metadata changes
-                # like holiday-without-hours-change) and return.
-                tp.atomic_write_plan(json_path, plan)
-                return {"ok": True, "sessions_modified": 0}
-
-            # Build a flat-projected tsb_series from the cached training
-            # snapshot so per-day _tsb_at lookups inside reforecast hit
-            # the dict (no fall-through to live ICU). ALWAYS a dict — when
-            # ICU is unreachable (current_tsb None) an empty dict makes
-            # _tsb_at return None per day; passing None here re-triggered
-            # the pre-v1.3.3 bug (one get_today_metrics fetch PER future
-            # hard session, ~36 round-trips per UPDATE click).
-            tsb_series: dict = {}
-            try:
-                training_snap = cached("training", get_today_metrics)
-                current_tsb = training_snap.get("tsb")
-            except Exception:
-                current_tsb = None
-            if current_tsb is not None:
-                for w in plan.get("weeks", []) or []:
-                    try:
-                        ws = date.fromisoformat(w["start"])
-                    except (KeyError, ValueError, TypeError):
+                # v1.7.3 — only feed CHANGED days into the scaler. A day's
+                # ``hours`` value must differ from the prior plan's entry
+                # (or be new) to count as user intent. Days the frontend
+                # auto-filled with the weekly-grid default never enter the
+                # override set, so they keep the planner's existing duration
+                # untouched.
+                availability_overrides: dict[str, float] = {}
+                for day_iso, entry in new_availability.items():
+                    new_h = _hours_of(entry)
+                    if new_h is None:
                         continue
-                    for i in range(7):
-                        tsb_series[ws + timedelta(days=i)] = current_tsb
-            try:
-                recent_activities = db.query_activities(days=120)
-            except Exception:
-                recent_activities = []
+                    old_h = _hours_of(prior_availability.get(day_iso))
+                    if old_h is None or abs(new_h - old_h) > 1e-6:
+                        availability_overrides[day_iso] = new_h
+                if not availability_overrides:
+                    # No user edits → nothing to reflow. Persist the new
+                    # availability dict (might carry type metadata changes
+                    # like holiday-without-hours-change) and return.
+                    tp.atomic_write_plan(json_path, plan)
+                    return {"ok": True, "sessions_modified": 0}
 
-            plan, sessions_modified, _ri = tp.reforecast_dict(
-                plan,
-                tsb_series=tsb_series,
-                recent_activities=recent_activities,
-                availability_overrides=availability_overrides,
-                # propagation_days=None lets reforecast emit its own
-                # touched ∪ g3_dropped set so downstream G3 downshifts
-                # land on disk too. Pre-v1.7.1 we pinned this to
-                # availability keys only, which suppressed downstream
-                # propagation entirely.
-            )
-        except Exception:  # noqa: BLE001
-            # Reflow is best-effort: if reforecast errors we still persist the
-            # availability dict so the next /api/plan/reforecast picks it up.
-            _log.exception("save-availability reflow skipped")
+                # Build a flat-projected tsb_series from the cached training
+                # snapshot so per-day _tsb_at lookups inside reforecast hit
+                # the dict (no fall-through to live ICU). ALWAYS a dict — when
+                # ICU is unreachable (current_tsb None) an empty dict makes
+                # _tsb_at return None per day; passing None here re-triggered
+                # the pre-v1.3.3 bug (one get_today_metrics fetch PER future
+                # hard session, ~36 round-trips per UPDATE click).
+                tsb_series: dict = {}
+                try:
+                    training_snap = cached("training", get_today_metrics)
+                    current_tsb = training_snap.get("tsb")
+                except Exception:
+                    current_tsb = None
+                if current_tsb is not None:
+                    for w in plan.get("weeks", []) or []:
+                        try:
+                            ws = date.fromisoformat(w["start"])
+                        except (KeyError, ValueError, TypeError):
+                            continue
+                        for i in range(7):
+                            tsb_series[ws + timedelta(days=i)] = current_tsb
+                try:
+                    recent_activities = db.query_activities(days=120)
+                except Exception:
+                    recent_activities = []
 
-        tp.atomic_write_plan(json_path, plan)
+                plan, sessions_modified, _ri = tp.reforecast_dict(
+                    plan,
+                    tsb_series=tsb_series,
+                    recent_activities=recent_activities,
+                    availability_overrides=availability_overrides,
+                    # propagation_days=None lets reforecast emit its own
+                    # touched ∪ g3_dropped set so downstream G3 downshifts
+                    # land on disk too. Pre-v1.7.1 we pinned this to
+                    # availability keys only, which suppressed downstream
+                    # propagation entirely.
+                )
+            except Exception:  # noqa: BLE001
+                # Reflow is best-effort: if reforecast errors we still persist the
+                # availability dict so the next /api/plan/reforecast picks it up.
+                _log.exception("save-availability reflow skipped")
+
+            tp.atomic_write_plan(json_path, plan)
 
         return {"ok": True, "sessions_modified": sessions_modified}
 
@@ -12535,25 +12544,26 @@ async def api_plan_regenerate_dynamic(request: Request):
 
     try:
 
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
+        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
 
-        # v4.3.0 B3: per-regen entropy salt. time.time_ns() gives us a fresh
-        # 19+ bit-of-entropy nonce per call — guaranteed different across two
-        # back-to-back POSTs on any modern OS clock.
-        seed_salt = time.time_ns()
+            # v4.3.0 B3: per-regen entropy salt. time.time_ns() gives us a fresh
+            # 19+ bit-of-entropy nonce per call — guaranteed different across two
+            # back-to-back POSTs on any modern OS clock.
+            seed_salt = time.time_ns()
 
-        # Get current CTL
-        training = cached("training", get_today_metrics)
-        current_ctl = _planning_ctl()
+            # Get current CTL
+            training = cached("training", get_today_metrics)
+            current_ctl = _planning_ctl()
 
-        activities = db.query_activities(days=120)
+            activities = db.query_activities(days=120)
 
-        plan_dict, regen_info = _regenerate_plan_dict(
-            plan, current_ctl=current_ctl, activities=activities, seed_salt=seed_salt,
-        )
+            plan_dict, regen_info = _regenerate_plan_dict(
+                plan, current_ctl=current_ctl, activities=activities, seed_salt=seed_salt,
+            )
 
-        tp.atomic_write_plan(json_path, plan_dict)
+            tp.atomic_write_plan(json_path, plan_dict)
 
         return {"ok": True, "plan_json": plan_dict, "regen_info": regen_info}
 
@@ -12605,21 +12615,22 @@ async def api_plan_add_race(request: Request):
         "event_type": str((body or {}).get("type") or (body or {}).get("event_type") or "crit"),
     }
     try:
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
-        goal = plan.setdefault("goal", {})
-        events = [e for e in (goal.get("events") or []) if (e or {}).get("date") != ev_date]
-        events.append(new_event)
-        goal["events"] = events
+        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
+            goal = plan.setdefault("goal", {})
+            events = [e for e in (goal.get("events") or []) if (e or {}).get("date") != ev_date]
+            events.append(new_event)
+            goal["events"] = events
 
-        seed_salt = time.time_ns()
-        training = cached("training", get_today_metrics)
-        current_ctl = _planning_ctl()
-        activities = db.query_activities(days=120)
-        plan_dict, regen_info = _regenerate_plan_dict(
-            plan, current_ctl=current_ctl, activities=activities, seed_salt=seed_salt,
-        )
-        tp.atomic_write_plan(json_path, plan_dict)
+            seed_salt = time.time_ns()
+            training = cached("training", get_today_metrics)
+            current_ctl = _planning_ctl()
+            activities = db.query_activities(days=120)
+            plan_dict, regen_info = _regenerate_plan_dict(
+                plan, current_ctl=current_ctl, activities=activities, seed_salt=seed_salt,
+            )
+            tp.atomic_write_plan(json_path, plan_dict)
         return {"ok": True, "plan_json": plan_dict, "regen_info": regen_info, "added": new_event}
     except ValueError as e:
         # FC5d (v2.5.0, L3-6): the shared regen core refuses a passed A-event
@@ -16034,27 +16045,28 @@ async def api_plan_re_draw(request: Request):
     if not json_path.exists():
         return JSONResponse({"error": "No active plan found"}, 404)
     try:
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
-        try:
-            candidate = _pick_redraw_candidate(plan, day_iso)
-        except tp.NoCandidateWorkoutError:
-            # True exhaustion (widened band included). NOT an error state:
-            # the day legitimately remains a fileless zone-target session —
-            # the UI maps this action to the "keeps its zone targets" toast.
-            return {"ok": False, "action": "no_candidate", "day": day_iso}
-        except ValueError as e:
-            reason = str(e)
-            if reason.startswith("No session at"):
-                return JSONResponse({"error": reason}, 404)
-            # rest_day keeps its legacy action string (test-pinned); other
-            # rejections (e.g. race day) surface their reason in the toast.
-            if reason == "rest_day":
-                return {"ok": False, "action": "rest_day", "day": day_iso}
-            return {"ok": False, "action": "invalid", "error": reason,
-                    "day": day_iso}
-        apply_res = _accept_redraw_apply(plan, day_iso, candidate)
-        tp.atomic_write_plan(json_path, plan)
+        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
+            try:
+                candidate = _pick_redraw_candidate(plan, day_iso)
+            except tp.NoCandidateWorkoutError:
+                # True exhaustion (widened band included). NOT an error state:
+                # the day legitimately remains a fileless zone-target session —
+                # the UI maps this action to the "keeps its zone targets" toast.
+                return {"ok": False, "action": "no_candidate", "day": day_iso}
+            except ValueError as e:
+                reason = str(e)
+                if reason.startswith("No session at"):
+                    return JSONResponse({"error": reason}, 404)
+                # rest_day keeps its legacy action string (test-pinned); other
+                # rejections (e.g. race day) surface their reason in the toast.
+                if reason == "rest_day":
+                    return {"ok": False, "action": "rest_day", "day": day_iso}
+                return {"ok": False, "action": "invalid", "error": reason,
+                        "day": day_iso}
+            apply_res = _accept_redraw_apply(plan, day_iso, candidate)
+            tp.atomic_write_plan(json_path, plan)
         return {"ok": True, "action": "redrawn", "day": day_iso,
                 "zwo_file": candidate["zwo_file"],
                 "zwo_name": candidate["zwo_name"],
@@ -16363,10 +16375,11 @@ async def api_plan_accept_redraw(request: Request):
     if not json_path.exists():
         return JSONResponse({"error": "No active plan found"}, 404)
     try:
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
-        result = _accept_redraw_apply(plan, day_iso, body)
-        tp.atomic_write_plan(json_path, plan)
+        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
+            result = _accept_redraw_apply(plan, day_iso, body)
+            tp.atomic_write_plan(json_path, plan)
         return result
     except ValueError as e:
         return JSONResponse({"error": str(e)}, 400)
@@ -16566,14 +16579,15 @@ async def api_plan_swap_type(request: Request):
     if not json_path.exists():
         return JSONResponse({"error": "No active plan found"}, 404)
     try:
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
-        _micro = (bool(micro_raw) if micro_raw is not None
-                  else bool((plan.get("goal", {}) or {})
-                            .get("vo2_microintervals_only", False)))
-        result = _swap_session_type_apply(plan, day_iso, new_type, new_dur,
-                                          micro_only=_micro)
-        tp.atomic_write_plan(json_path, plan)
+        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
+            _micro = (bool(micro_raw) if micro_raw is not None
+                      else bool((plan.get("goal", {}) or {})
+                                .get("vo2_microintervals_only", False)))
+            result = _swap_session_type_apply(plan, day_iso, new_type, new_dur,
+                                              micro_only=_micro)
+            tp.atomic_write_plan(json_path, plan)
         return result
     except ValueError as e:
         return JSONResponse({"error": str(e)}, 400)
@@ -16630,35 +16644,36 @@ async def api_plan_ftp_test_type(request: Request):
     if not json_path.exists():
         return JSONResponse({"error": "No active plan found"}, 404)
     try:
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
-        target = next((s for w in plan.get("weeks", [])
-                       for s in w.get("sessions", []) if s.get("day") == day_iso), None)
-        if not target:
-            return JSONResponse({"error": f"No session at {day_iso}"}, 404)
-        if target.get("session_type") != "ftp_test":
-            return JSONResponse({"error": "not an FTP-test session"}, 400)
-        # W1b: serve the family's PREFERRED protocol file (ramp = the 6%/min
-        # ladder detect_ramp_halt reconstructs); duration-closest is only the
-        # renamed-file fallback.
-        pref_file, want_dur, nominal_tss = _FTP_TEST_PREFERRED_FILE[test_type]
-        cands = [w for w in tp.load_workout_library()
-                 if _ftp_test_family(w.get("File", "")) == test_type]
-        if not cands:
-            return JSONResponse({"error": f"no {test_type} workout in library"}, 404)
-        pick = next((w for w in cands if w.get("File") == pref_file), None)
-        if pick is None:
-            pick = min(cands,
-                       key=lambda w: abs((w.get("Duration(min)") or 0) - want_dur))
-        target["zwo_file"] = pick["File"]
-        target["zwo_name"] = pick.get("Name") or pick["File"]
-        target["duration_min"] = int(pick.get("Duration(min)") or want_dur)
-        # W1b: keep the load forecast honest — the hour-of-power carries ~2×
-        # the TSS of a ramp, and reforecast/eval read tss_estimate.
-        target["tss_estimate"] = max(round(float(pick.get("TSS") or 0)), nominal_tss)
-        target["ftp_test_type"] = test_type
-        target["user_swapped"] = True   # the rider's deliberate choice
-        tp.atomic_write_plan(json_path, plan)
+        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
+            target = next((s for w in plan.get("weeks", [])
+                           for s in w.get("sessions", []) if s.get("day") == day_iso), None)
+            if not target:
+                return JSONResponse({"error": f"No session at {day_iso}"}, 404)
+            if target.get("session_type") != "ftp_test":
+                return JSONResponse({"error": "not an FTP-test session"}, 400)
+            # W1b: serve the family's PREFERRED protocol file (ramp = the 6%/min
+            # ladder detect_ramp_halt reconstructs); duration-closest is only the
+            # renamed-file fallback.
+            pref_file, want_dur, nominal_tss = _FTP_TEST_PREFERRED_FILE[test_type]
+            cands = [w for w in tp.load_workout_library()
+                     if _ftp_test_family(w.get("File", "")) == test_type]
+            if not cands:
+                return JSONResponse({"error": f"no {test_type} workout in library"}, 404)
+            pick = next((w for w in cands if w.get("File") == pref_file), None)
+            if pick is None:
+                pick = min(cands,
+                           key=lambda w: abs((w.get("Duration(min)") or 0) - want_dur))
+            target["zwo_file"] = pick["File"]
+            target["zwo_name"] = pick.get("Name") or pick["File"]
+            target["duration_min"] = int(pick.get("Duration(min)") or want_dur)
+            # W1b: keep the load forecast honest — the hour-of-power carries ~2×
+            # the TSS of a ramp, and reforecast/eval read tss_estimate.
+            target["tss_estimate"] = max(round(float(pick.get("TSS") or 0)), nominal_tss)
+            target["ftp_test_type"] = test_type
+            target["user_swapped"] = True   # the rider's deliberate choice
+            tp.atomic_write_plan(json_path, plan)
         # v3.11.3: hand back the FILE-derived enrichment the day modal reads
         # (display_name / zwo_duration_min / zwo_tss) so the panel refreshes
         # without a full plan reload.
@@ -16701,32 +16716,33 @@ async def api_plan_dismiss_session(request: Request):
         return JSONResponse({"error": "Invalid date format"}, 400)
 
     try:
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
+        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
 
-        # L3-11 (v2.5.0): operate on ALL sessions matching the date, not the
-        # first match — on a (legacy) duplicated date the earlier row's copy
-        # got dismissed while the later row's conflicting copy stayed pending,
-        # so the user's dismissal "didn't stick". Post-FC1 duplicates can't be
-        # produced anymore; the all-matches loop stays as defense for plans
-        # persisted before the clip engine.
-        matched = [s for w in plan.get("weeks", [])
-                   for s in w.get("sessions", []) if s.get("day") == d_iso]
-        if not matched:
-            return JSONResponse({"error": f"no session at {d_iso}"}, 404)
-        # FC3 (v2.5.0): the race entry is not dismissable — goal-owned.
-        if any(s.get("is_race") for s in matched):
-            return JSONResponse(
-                {"error": "race day is fixed — edit the race instead"}, 400)
-        for s in matched:
-            if undo:
-                s["status"] = "pending"
-                s["dismissed_at"] = ""
-            else:
-                s["status"] = "dismissed"
-                s["dismissed_at"] = clock.now().isoformat()
+            # L3-11 (v2.5.0): operate on ALL sessions matching the date, not the
+            # first match — on a (legacy) duplicated date the earlier row's copy
+            # got dismissed while the later row's conflicting copy stayed pending,
+            # so the user's dismissal "didn't stick". Post-FC1 duplicates can't be
+            # produced anymore; the all-matches loop stays as defense for plans
+            # persisted before the clip engine.
+            matched = [s for w in plan.get("weeks", [])
+                       for s in w.get("sessions", []) if s.get("day") == d_iso]
+            if not matched:
+                return JSONResponse({"error": f"no session at {d_iso}"}, 404)
+            # FC3 (v2.5.0): the race entry is not dismissable — goal-owned.
+            if any(s.get("is_race") for s in matched):
+                return JSONResponse(
+                    {"error": "race day is fixed — edit the race instead"}, 400)
+            for s in matched:
+                if undo:
+                    s["status"] = "pending"
+                    s["dismissed_at"] = ""
+                else:
+                    s["status"] = "dismissed"
+                    s["dismissed_at"] = clock.now().isoformat()
 
-        tp.atomic_write_plan(json_path, plan)
+            tp.atomic_write_plan(json_path, plan)
 
         return {"ok": True, "dismissed": not undo}
 
@@ -16747,137 +16763,138 @@ def api_plan_auto_recalc():
         return {"action": "no_plan"}
 
     try:
-        with open(json_path, encoding="utf-8") as f:
-            plan = json.load(f)
+        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+            with open(json_path, encoding="utf-8") as f:
+                plan = json.load(f)
 
-        # Check if recalc needed (>7 days since last)
-        last_recalc = plan.get("recalc_date") or plan.get("generated", "")
-        if last_recalc:
-            try:
-                last_dt = datetime.fromisoformat(last_recalc)
-                # Normalize so naive/aware mismatch can't raise TypeError.
-                # Saved plans may include a tz offset (saved_at uses
-                # `.astimezone().isoformat()` elsewhere); strip it so the
-                # subtraction with `clock.now()` is always homogeneous.
-                if last_dt.tzinfo is not None:
-                    last_dt = last_dt.replace(tzinfo=None)
-                days_since = (clock.now() - last_dt).days
-                if days_since < 7:
-                    # Still fresh — return event readiness only.
-                    # 3.3.2 (Lapo #2): readiness is DECORATIVE on this branch —
-                    # its own try, so a readiness/metrics exception can never
-                    # convert a FRESH verdict into a full plan rebuild (the old
-                    # shared except turned any ValueError/TypeError here into a
-                    # silent every-visit recalc).
-                    readiness = {}
-                    try:
-                        training = cached("training", get_today_metrics)
-                        current_ctl = _planning_ctl()
-                        g = plan.get("goal", {})
-                        goal = tp.goal_from_dict(g)
-                        if goal.target_date:           # one that parses
-                            if goal.longest_ride_h_90d is None:
-                                goal.longest_ride_h_90d = _longest_ride_h_90d()
-                            readiness = tp.compute_event_readiness(goal, current_ctl)
-                    except Exception:  # noqa: BLE001 — decorative readiness only
-                        _log.exception("auto-recalc: fresh-branch readiness failed (returning fresh)")
+            # Check if recalc needed (>7 days since last)
+            last_recalc = plan.get("recalc_date") or plan.get("generated", "")
+            if last_recalc:
+                try:
+                    last_dt = datetime.fromisoformat(last_recalc)
+                    # Normalize so naive/aware mismatch can't raise TypeError.
+                    # Saved plans may include a tz offset (saved_at uses
+                    # `.astimezone().isoformat()` elsewhere); strip it so the
+                    # subtraction with `clock.now()` is always homogeneous.
+                    if last_dt.tzinfo is not None:
+                        last_dt = last_dt.replace(tzinfo=None)
+                    days_since = (clock.now() - last_dt).days
+                    if days_since < 7:
+                        # Still fresh — return event readiness only.
+                        # 3.3.2 (Lapo #2): readiness is DECORATIVE on this branch —
+                        # its own try, so a readiness/metrics exception can never
+                        # convert a FRESH verdict into a full plan rebuild (the old
+                        # shared except turned any ValueError/TypeError here into a
+                        # silent every-visit recalc).
                         readiness = {}
-                    return {"action": "fresh", "days_since_recalc": days_since, "event_readiness": readiness}
-            except (ValueError, TypeError):
-                pass
+                        try:
+                            training = cached("training", get_today_metrics)
+                            current_ctl = _planning_ctl()
+                            g = plan.get("goal", {})
+                            goal = tp.goal_from_dict(g)
+                            if goal.target_date:           # one that parses
+                                if goal.longest_ride_h_90d is None:
+                                    goal.longest_ride_h_90d = _longest_ride_h_90d()
+                                readiness = tp.compute_event_readiness(goal, current_ctl)
+                        except Exception:  # noqa: BLE001 — decorative readiness only
+                            _log.exception("auto-recalc: fresh-branch readiness failed (returning fresh)")
+                            readiness = {}
+                        return {"action": "fresh", "days_since_recalc": days_since, "event_readiness": readiness}
+                except (ValueError, TypeError):
+                    pass
 
-        # Recalc needed — rebuild plan
-        training = cached("training", get_today_metrics)
-        current_ctl = _planning_ctl()
+            # Recalc needed — rebuild plan
+            training = cached("training", get_today_metrics)
+            current_ctl = _planning_ctl()
 
-        # Reconstruct Goal via the canonical helper — the old inline build here
-        # dropped distribution/custom_bands/events/block_periodization/
-        # plan_mode/start_date/…, so a weekly recalc rebudgeted non-polarized
-        # plans to the sticky process default (same defect as the regen core's
-        # inline Goal, fixed the same way). NOTE: recalculate_plan itself runs
-        # no _mark_race_days/_apply_secondary_event_tapers pass — carrying
-        # goal.events here feeds its adjusted_goal, but the taper gap is a
-        # separate engine issue.
-        g = plan.get("goal", {})
-        goal = _goal_from_plan_dict(g)
-        if goal.target_date is None and goal.goal_type != "continuous":
-            # Non-event goals (FTP, general): use target_date or default 12
-            # weeks out. 3.4.0 W2: NOT for continuous — the rolling goal has
-            # no target by definition (grill P1 item 16, the A1 fabrication);
-            # recalculate_plan routes it to the extend path regardless.
-            goal.target_date = date.fromisoformat(g["target_date"]) if g.get("target_date") else (clock.today() + timedelta(weeks=12))
-        # Stale generation-time week count must not outlive the shrinking
-        # runway (weeks_available short-circuits on plan_weeks>0 — H1 trap).
-        goal.plan_weeks = 0
-        # v3.2.0 merge note: the canonical helper carries phase_weeks here
-        # too — the engine's validity gate decides applied-vs-fallback and
-        # the scheduler write-site mirrors goal._phase_weeks_status.
-        # v4.6.7 IMPL-CAP: auto-populate endurance baseline if missing.
-        if goal.longest_ride_h_90d is None:
-            goal.longest_ride_h_90d = _longest_ride_h_90d()
+            # Reconstruct Goal via the canonical helper — the old inline build here
+            # dropped distribution/custom_bands/events/block_periodization/
+            # plan_mode/start_date/…, so a weekly recalc rebudgeted non-polarized
+            # plans to the sticky process default (same defect as the regen core's
+            # inline Goal, fixed the same way). NOTE: recalculate_plan itself runs
+            # no _mark_race_days/_apply_secondary_event_tapers pass — carrying
+            # goal.events here feeds its adjusted_goal, but the taper gap is a
+            # separate engine issue.
+            g = plan.get("goal", {})
+            goal = _goal_from_plan_dict(g)
+            if goal.target_date is None and goal.goal_type != "continuous":
+                # Non-event goals (FTP, general): use target_date or default 12
+                # weeks out. 3.4.0 W2: NOT for continuous — the rolling goal has
+                # no target by definition (grill P1 item 16, the A1 fabrication);
+                # recalculate_plan routes it to the extend path regardless.
+                goal.target_date = date.fromisoformat(g["target_date"]) if g.get("target_date") else (clock.today() + timedelta(weeks=12))
+            # Stale generation-time week count must not outlive the shrinking
+            # runway (weeks_available short-circuits on plan_weeks>0 — H1 trap).
+            goal.plan_weeks = 0
+            # v3.2.0 merge note: the canonical helper carries phase_weeks here
+            # too — the engine's validity gate decides applied-vs-fallback and
+            # the scheduler write-site mirrors goal._phase_weeks_status.
+            # v4.6.7 IMPL-CAP: auto-populate endurance baseline if missing.
+            if goal.longest_ride_h_90d is None:
+                goal.longest_ride_h_90d = _longest_ride_h_90d()
 
-        # Reconstruct plan weeks.
-        # v1.8.20 parity — round-trip ALL session fields via the canonical
-        # helper: the old 6-field rebuild zeroed user_moved/status/dismissed_at/
-        # completion_matches/is_race/zwo_file/…, so every weekly recalc write
-        # wiped rider edits + race markers from every week, past ones included.
-        old_weeks = []
-        for w in plan.get("weeks", []):
-            old_weeks.append(tp.week_from_dict(w))
+            # Reconstruct plan weeks.
+            # v1.8.20 parity — round-trip ALL session fields via the canonical
+            # helper: the old 6-field rebuild zeroed user_moved/status/dismissed_at/
+            # completion_matches/is_race/zwo_file/…, so every weekly recalc write
+            # wiped rider edits + race markers from every week, past ones included.
+            old_weeks = []
+            for w in plan.get("weeks", []):
+                old_weeks.append(tp.week_from_dict(w))
 
-        # Get eFTP for drift detection
-        eftp = None
-        wellness = cached("wellness_7", lambda: fetch_wellness(7))
-        if wellness:
-            for w in reversed(wellness):
-                si = w.get("sportInfo", [])
-                if si and len(si) > 0 and si[0].get("eftp"):
-                    eftp = round(si[0]["eftp"])
-                    break
+            # Get eFTP for drift detection
+            eftp = None
+            wellness = cached("wellness_7", lambda: fetch_wellness(7))
+            if wellness:
+                for w in reversed(wellness):
+                    si = w.get("sportInfo", [])
+                    if si and len(si) > 0 and si[0].get("eftp"):
+                        eftp = round(si[0]["eftp"])
+                        break
 
-        # v2.0.3 F5 — thread athlete (ftp + weight) so recalculate_plan can
-        # compute event targets, matching the generate + regenerate paths
-        # (without it, a weekly recalc reverted to the legacy +5/+5 CTL step).
-        recalc_athlete = _planner_athlete()
+            # v2.0.3 F5 — thread athlete (ftp + weight) so recalculate_plan can
+            # compute event targets, matching the generate + regenerate paths
+            # (without it, a weekly recalc reverted to the legacy +5/+5 CTL step).
+            recalc_athlete = _planner_athlete()
 
-        new_phases, all_weeks, recalc_info = tp.recalculate_plan(
-            goal=goal, current_plan_weeks=old_weeks,
-            current_ctl=current_ctl, current_eftp=eftp,
-            athlete=recalc_athlete,
-            recent_weekly_tss=_chronic_weekly_tss_safe(),
-        )
+            new_phases, all_weeks, recalc_info = tp.recalculate_plan(
+                goal=goal, current_plan_weeks=old_weeks,
+                current_ctl=current_ctl, current_eftp=eftp,
+                athlete=recalc_athlete,
+                recent_weekly_tss=_chronic_weekly_tss_safe(),
+            )
 
-        if recalc_info.get("action") == "no_change":
-            return {"action": "no_change", **recalc_info}
+            if recalc_info.get("action") == "no_change":
+                return {"action": "no_change", **recalc_info}
 
-        # Save updated plan — START from a shallow copy of the ORIGINAL plan so
-        # every top-level key survives (availability calendar, adoption/regen
-        # markers, …), mirroring the v1.8.20 regen-path fix. Sessions serialize
-        # via the canonical helper (all 22 fields): the old inline 8-field dict
-        # dropped is_race/race/status/user_moved/dismissed_at/completion_matches
-        # from EVERY week on EVERY weekly recalc write.
-        plan_dict = dict(plan)
-        if new_phases:
-            plan_dict["phases"] = [
-                {"name": p.name, "weeks": p.weeks,
-                 "start": p.start.isoformat(), "end": p.end.isoformat(),
-                 "weekly_tss": p.weekly_tss_target, "focus": p.focus}
-                for p in new_phases
-            ]
-        plan_dict["weeks"] = [tp.week_to_dict(w) for w in all_weeks]
-        plan_dict["recalc_date"] = clock.now().isoformat()
-        plan_dict["recalc_info"] = recalc_info
-        # Phase-split editor (v3.2.0, A1): the overlay copy above keeps every
-        # old top-level key, so the previous rebuild's phase_weeks_status
-        # would survive as a STALE badge — mirror THIS recalc's status: set
-        # when the engine surfaced one, pop when it didn't (no custom split).
-        _pws = recalc_info.get("phase_weeks_status")
-        if _pws:
-            plan_dict["phase_weeks_status"] = _pws
-        else:
-            plan_dict.pop("phase_weeks_status", None)
+            # Save updated plan — START from a shallow copy of the ORIGINAL plan so
+            # every top-level key survives (availability calendar, adoption/regen
+            # markers, …), mirroring the v1.8.20 regen-path fix. Sessions serialize
+            # via the canonical helper (all 22 fields): the old inline 8-field dict
+            # dropped is_race/race/status/user_moved/dismissed_at/completion_matches
+            # from EVERY week on EVERY weekly recalc write.
+            plan_dict = dict(plan)
+            if new_phases:
+                plan_dict["phases"] = [
+                    {"name": p.name, "weeks": p.weeks,
+                     "start": p.start.isoformat(), "end": p.end.isoformat(),
+                     "weekly_tss": p.weekly_tss_target, "focus": p.focus}
+                    for p in new_phases
+                ]
+            plan_dict["weeks"] = [tp.week_to_dict(w) for w in all_weeks]
+            plan_dict["recalc_date"] = clock.now().isoformat()
+            plan_dict["recalc_info"] = recalc_info
+            # Phase-split editor (v3.2.0, A1): the overlay copy above keeps every
+            # old top-level key, so the previous rebuild's phase_weeks_status
+            # would survive as a STALE badge — mirror THIS recalc's status: set
+            # when the engine surfaced one, pop when it didn't (no custom split).
+            _pws = recalc_info.get("phase_weeks_status")
+            if _pws:
+                plan_dict["phase_weeks_status"] = _pws
+            else:
+                plan_dict.pop("phase_weeks_status", None)
 
-        tp.atomic_write_plan(json_path, plan_dict)
+            tp.atomic_write_plan(json_path, plan_dict)
 
         return {"action": "recalculated", "plan_json": plan_dict, **recalc_info}
 

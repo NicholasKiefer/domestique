@@ -11,6 +11,7 @@ Locks:
 from __future__ import annotations
 
 import json
+import re
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -130,9 +131,8 @@ def test_generate_site_stamps_snapshot_source_level():
     (the generate endpoint is exercised end-to-end by the planner suites)."""
     src = (ROOT / "src" / "app.py").read_text(encoding="utf-8")
     assert src.count("tp.plan_ctl_snapshot(") == 2
-    gen = src.index('"generated": clock.now().isoformat(),\n            '
-                    '# P4.2')
-    assert gen != -1
+    # Indentation-agnostic: #32 nested the generate body in the plan lock.
+    assert re.search(r'"generated": clock\.now\(\)\.isoformat\(\),\n\s+# P4\.2', src)
 
 
 # ── /api/plan payload: snapshot + live CTL exposed ───────────────────────────
