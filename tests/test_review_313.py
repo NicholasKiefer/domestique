@@ -65,6 +65,68 @@ def test_no_async_endpoint_takes_the_blocking_plan_lock():
     assert bad == [], "use `async with tp.plan_write_lock_async()` in: " + ", ".join(bad)
 
 
+def test_no_async_endpoint_reaches_the_blocking_plan_lock_through_a_helper():
+    tree = ast.parse(APP.read_text(encoding="utf-8"))
+    funcs = {}
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funcs.setdefault(n.name, []).append(n)
+
+    def calls(node):
+        out = set()
+        stack = list(ast.iter_child_nodes(node))
+        while stack:
+            x = stack.pop()
+            if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue                     # nested defs run elsewhere (threadpool)
+            if isinstance(x, ast.Call):
+                f = x.func
+                out.add(f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None))
+            stack.extend(ast.iter_child_nodes(x))
+        return out
+
+    def takes_lock(fn):
+        for x in ast.walk(fn):
+            if isinstance(x, ast.With) and any(
+                    getattr(getattr(i.context_expr, "func", None), "attr", "") == "plan_write_lock"
+                    for i in x.items):
+                return True
+        return "atomic_write_plan" in calls(fn)
+
+    blocking = {name for name, fns in funcs.items()
+                if any(isinstance(f, ast.FunctionDef) and takes_lock(f) for f in fns)}
+    grew = True
+    while grew:
+        grew = False
+        for name, fns in funcs.items():
+            if name not in blocking and any(isinstance(f, ast.FunctionDef) and calls(f) & blocking for f in fns):
+                blocking.add(name); grew = True
+
+    bad = []
+    for name, fns in funcs.items():
+        for f in fns:
+            if not isinstance(f, ast.AsyncFunctionDef) or name == "lifespan":
+                continue
+            # calls outside any `async with plan_write_lock_async()` body
+            inside = set()
+            for x in ast.walk(f):
+                if isinstance(x, ast.AsyncWith):
+                    for s in x.body:
+                        inside |= {id(y) for y in ast.walk(s)}
+            stack = list(ast.iter_child_nodes(f))
+            while stack:
+                x = stack.pop()
+                if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    continue
+                if isinstance(x, ast.Call) and id(x) not in inside:
+                    fn = x.func
+                    nm = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+                    if nm in blocking:
+                        bad.append(f"{name} line {x.lineno} -> {nm}")
+                stack.extend(ast.iter_child_nodes(x))
+    assert bad == [], bad
+
+
 def test_a_waiting_plan_endpoint_does_not_freeze_other_requests(plan_dir):
     tmp, monday = plan_dir
     tue = (monday + timedelta(days=1)).isoformat()
@@ -235,3 +297,15 @@ def test_settings_count_is_labelled_with_the_profile_the_run_was_for(monkeypatch
     app_module._icu_push_note_result({"pushed": 0, "held": 2, "profile_id": "anna"})
     assert app_module._icu_push_last_result["profile_id"] == "anna"
     assert app_module._last_result_for_active_profile() is None
+
+
+
+def test_a_manual_push_behind_a_sweep_still_runs(env):
+    """Grill L1: the rider's own Push after a sweep must not come back as
+    "swept" ("couldn't reach intervals.icu")."""
+    from test_icu_hold_28 import _write_plan
+    _write_plan(_week(wed="steady.zwo"))
+    stale = icp._SWEEP_GENERATION
+    icp.sweep_all()                                       # bumps the generation
+    assert icp._reconcile_unless_swept(14, stale)["error"] == "swept"   # background
+    assert icp.reconcile(abort_if_swept=False)["pushed"] == 1           # rider's Push

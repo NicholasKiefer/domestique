@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 import fitness_estimation as fe
+from test_icu_push import stub  # noqa: F401  (fixture)
 
 DASHBOARD = Path(__file__).resolve().parent.parent / "src" / "templates" / "dashboard.html"
 FILE = "ftp_test_cp_12-7-3min_100pct_110min.zwo"
@@ -46,9 +47,47 @@ def test_the_test_is_recognised_by_its_file_or_name_and_scored():
         assert "w_prime_j" in sug and "cp_w" in sug
 
 
-def test_never_recognised_from_the_power_shape_alone():
-    out = fe.evaluate_ftp_test(_cp_ride(), filename_hint="Saturday ride", prior_ftp=240)
-    assert out is None or out["ftp_test_type"] != "cp_test"
+def _zwo_shaped_cp_ride(cp=250.0, wp=20000.0, old_ftp=240):
+    """The shipped .zwo ridden as written (grill 3.13.0)."""
+    p12, p7, p3 = (round(cp + wp / t) for t in (720, 420, 180))
+    f = old_ftp
+    warm = [round(f * (0.45 + 0.25 * i / 600)) for i in range(600)]
+    openers = ([round(f * 0.95)] * 60 + [round(f * 0.5)] * 60) * 3
+    return (warm + openers + [round(f * 0.5)] * 240 + [p12] * 720
+            + [round(f * 0.4)] * 1800 + [p7] * 420 + [round(f * 0.4)] * 1800
+            + [p3] * 180 + [round(f * (0.6 - 0.2 * i / 480)) for i in range(480)])
+
+
+@pytest.mark.parametrize("hint", [None, "Morning Ride", "Saturday ride"])
+def test_a_cp_ride_without_its_name_is_silent_not_a_20min_test(hint):
+    """Grill H1: the 20-min calculator read the 12-min effort plus rest as
+    its block, ~17% low. A ride that only looks like a CP test is silent."""
+    for ride in (_cp_ride(), _zwo_shaped_cp_ride()):
+        assert fe.evaluate_ftp_test(ride, filename_hint=hint, prior_ftp=240) is None
+
+
+def test_an_app_prefixed_name_still_names_the_cp_test():
+    out = fe.evaluate_ftp_test(_zwo_shaped_cp_ride(), prior_ftp=240,
+                               filename_hint="Zwift - FTP Test — CP 12/7/3 Critical Power (110min) in Watopia")
+    assert out["ftp_test_type"] == "cp_test" and out["ftp_test_suggestion"]["ftp"] == 250
+
+
+def test_a_submaximal_3min_effort_is_silent_not_an_inflated_cp():
+    """Grill M1: 278/298/320 W (the 3 min ridden tired) fitted CP 270 W,
+    8% high, at R² 0.93."""
+    assert fe.cp_test_ftp(_ride(278, 298, 320)) is None
+    # Efforts each ~2% off still score, close to the truth.
+    s = fe.cp_test_ftp(_ride(278, 304, 361))
+    assert s is not None and abs(s["cp_w"] - 250) <= 12
+
+
+@pytest.mark.parametrize("method,source", [("cp_test", "tested_cp_test"), ("sixty_min", "tested_sixty_min")])
+def test_accepting_the_result_updates_ftp(stub, method, source):
+    """Grill C1: Update answered 400 "unknown method" for both protocols."""
+    r = stub.client.post("/api/profile/update-ftp", json={
+        "ftp": 250, "method": method, "source": source, "applied": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["ftp"] == 250 and r.json()["ftp_source"] == source
 
 
 @pytest.mark.parametrize("ride,why", [

@@ -435,7 +435,7 @@ async def plan_write_lock_async():
     another coroutine on that thread could re-enter it."""
     import asyncio
     while not _plan_write_lock.acquire(blocking=False):
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.005)
     try:
         yield
     finally:

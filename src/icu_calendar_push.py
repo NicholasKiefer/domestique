@@ -849,7 +849,7 @@ def _one_at_a_time(timeout_s: float, fn, *args):
         _RECONCILE_LOCK.release()
 
 
-def reconcile(horizon_days: int = HORIZON_DAYS) -> dict:
+def reconcile(horizon_days: int = HORIZON_DAYS, abort_if_swept: bool = True) -> dict:
     """Mirror [today, today+horizon] of the stored plan onto the ICU calendar.
 
     Returns {pushed, updated, deleted, skipped:[{day,reason}], held} plus at
@@ -858,8 +858,10 @@ def reconcile(horizon_days: int = HORIZON_DAYS) -> dict:
     or later left where the rider moved them in intervals.icu (#28); it is 0
     on every early return (W6). Never raises; never writes the plan.
     """
+    # The rider's own Push (abort_if_swept=False) is never dropped: it asked
+    # for this run after whatever sweep it waited behind.
     out = _one_at_a_time(_RECONCILE_LOCK_TIMEOUT_S, _reconcile_unless_swept,
-                         horizon_days, _SWEEP_GENERATION)
+                         horizon_days, _SWEEP_GENERATION if abort_if_swept else None)
     out.setdefault("held", 0)
     return out
 
@@ -871,8 +873,8 @@ def reconcile(horizon_days: int = HORIZON_DAYS) -> dict:
 _SWEEP_GENERATION = 0
 
 
-def _reconcile_unless_swept(horizon_days: int, generation: int) -> dict:
-    if generation != _SWEEP_GENERATION:
+def _reconcile_unless_swept(horizon_days: int, generation: "int | None") -> dict:
+    if generation is not None and generation != _SWEEP_GENERATION:
         _log.info("EVENT=icu_calendar_push_skipped reason=swept")
         return _result(error="swept")
     return _reconcile(horizon_days)

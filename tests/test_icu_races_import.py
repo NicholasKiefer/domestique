@@ -104,6 +104,7 @@ def test_oauth_without_calendar_scope_asks_to_reconnect(env, monkeypatch):
 
 @pytest.mark.parametrize("status,raw,expect", [
     (403, b'{"error":"insufficient scope CALENDAR:READ"}', {"needs_reconnect": True}),
+    (401, b'{"error":"token expired"}', {"needs_reconnect": True}),
     (0, b"", {"error": "network"}),
     (500, b"down", {"error": "http_500"}),
     (200, b"<html>", {"error": "bad_response"}),
@@ -215,3 +216,24 @@ icuRacesApply();
 console.log(JSON.stringify({goal: els['plan-goal'].value, edate: els['plan-edate'].value,
   rows: bcRows.map(r => [r.ev.date, r.ev.priority, r.ev.event_km])}));""")
     assert out == {"goal": "ftp", "edate": "", "rows": [["2027-03-01", "B", 90]]}
+
+
+@needs_node
+def test_b_c_after_the_goal_already_in_the_builder_are_left_out():
+    """Grill L4/L5: no A picked in the table, but the builder already has an
+    event goal: races after it have no week. And a goal race without a
+    distance clears the old event's distance."""
+    out = _run(_DOM + _fns("icuRacesApply") + """
+els['plan-goal'].value = 'event';
+els['plan-edate'].value = '2026-12-01';
+_icuRaces = [{date: '2027-02-10', name: 'Late B', priority: 'B', distance_km: null},
+             {date: '2026-11-10', name: 'Early C', priority: 'C', distance_km: null}];
+picks = [{dataset: {i: '0'}, value: 'B'}, {dataset: {i: '1'}, value: 'C'}];
+const res = icuRacesApply();
+_icuRaces = [{date: '2027-01-20', name: 'Hill climb', priority: 'A', distance_km: null}];
+picks = [{dataset: {i: '0'}, value: 'A'}];
+icuRacesApply();
+console.log(JSON.stringify({added: res.added, later: res.later, ekm: els['plan-ekm'].value,
+  rows: bcRows.map(r => r.ev.date)}));""")
+    assert (out["added"], out["later"]) == (1, 1)
+    assert out["rows"] == ["2026-11-10"] and out["ekm"] == ""

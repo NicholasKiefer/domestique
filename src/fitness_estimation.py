@@ -630,6 +630,11 @@ def _minute_averages(powers: list[float]) -> list[float]:
 # docs/SCIENCE.md.
 CP_TEST_EFFORTS_S = (720, 420, 180)
 CP_TEST_MIN_GAP_S = 600     # efforts must be separate: the protocol rests 30 min
+# Three points, two parameters: one degree of freedom, so the fit must be
+# near-perfect. Efforts off by ~2% still fit at R² ~0.99; a 3-min effort
+# ridden well below maximal (tired after the other two) falls to ~0.93 and
+# would inflate CP by ~8% -- silent instead (3.13.0 grill).
+CP_TEST_R2_MIN = 0.98
 
 
 def _best_window_clear_of(powers: list, dur: int, taken: list, gap: int):
@@ -656,9 +661,9 @@ def cp_test_ftp(power_series) -> "dict | None":
     separate window, fitted to P = W'/t + CP (least squares). FTP = CP.
 
     Correct or silent: None unless the efforts get harder as they get
-    shorter, the fit is good (R² >= MONOD_R2_MIN) and W' is physiological
-    (5-40 kJ, the profile's own bounds). A ride without the three efforts
-    therefore never produces a number."""
+    shorter, the fit is near-perfect (R² >= CP_TEST_R2_MIN) and W' is
+    physiological (5-40 kJ, the profile's own bounds). Recognition is by
+    name only, so a ride is scored only when the rider meant to ride it."""
     powers = [float(p or 0) for p in (power_series or [])]
     taken, eff = [], {}
     for dur in CP_TEST_EFFORTS_S:
@@ -680,7 +685,7 @@ def cp_test_ftp(power_series) -> "dict | None":
     ss_tot = sum((y - my) ** 2 for y in ys)
     ss_res = sum((y - (cp + wprime * x)) ** 2 for x, y in zip(xs, ys))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-    if cp <= 0 or not (5000 <= wprime <= 40000) or r2 < MONOD_R2_MIN:
+    if cp <= 0 or not (5000 <= wprime <= 40000) or r2 < CP_TEST_R2_MIN:
         return None
     s12 = eff[720][1]
     return {
@@ -715,6 +720,11 @@ def _hint_test_kind(filename_hint) -> "str | None":
         if not src:
             continue
         lname = re.sub(r"[^a-z0-9]+", "_", str(src).lower()).strip("_")
+        # The CP test's token counts anywhere in a name: apps prefix their
+        # own ("Zwift - FTP Test — CP 12/7/3 …"), and its scorer is silent
+        # without three real efforts.
+        if "ftp_test_cp" in lname:
+            return "cp_test"
         if not lname.startswith("ftp_test"):
             continue
         if "ftp_test_coggan" in lname:
@@ -723,8 +733,6 @@ def _hint_test_kind(filename_hint) -> "str | None":
             return "ramp"
         if "ftp_test_60min" in lname:
             return "sixty_min"
-        if "ftp_test_cp" in lname:
-            return "cp_test"
     return None
 
 
@@ -916,6 +924,12 @@ def evaluate_ftp_test(power_series, cadence_series=None,
         ]
     kind = detect_ftp_test_shape(power_series, filename_hint=filename_hint)
     if not kind:
+        return None
+    if (kind == "coggan_20min" and not _hint_test_kind(filename_hint)
+            and cp_test_ftp(power_series) is not None):
+        # A ride with the CP test's three efforts, recognised by shape only
+        # (no name): the 20-min calculator would read its 12-min effort plus
+        # rest as the 20-min block, ~17% low. Ambiguous, so silent.
         return None
     fallback = False
     if kind == "coggan_20min":

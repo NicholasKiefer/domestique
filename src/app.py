@@ -1808,9 +1808,10 @@ def api_profile_ftp_history():
         # Derive the canonical "type" from source if populated (catches
         # eftp_auto / eftp_icu / tested_* enums), else fall back to method.
         if src in ("eftp_auto", "eftp_icu", "eftp_local",
-                   "tested_coggan_20min", "tested_ramp", "tested_cp_test"):
+                   "tested_coggan_20min", "tested_ramp", "tested_sixty_min",
+                   "tested_cp_test"):
             row_type = src
-        elif method in ("coggan_20min", "ramp", "cp_test"):
+        elif method in ("coggan_20min", "ramp", "sixty_min", "cp_test"):
             row_type = f"tested_{method}"
         else:
             row_type = "manual"
@@ -1850,6 +1851,7 @@ def api_profile_update_ftp(body: dict):
     source_map = {
         "coggan_20min": "tested_coggan_20min",
         "ramp": "tested_ramp",
+        "sixty_min": "tested_sixty_min",
         "cp_test": "tested_cp_test",
         "manual": "manual",
     }
@@ -7855,7 +7857,7 @@ def _icu_push_debounced_run(expected_pid: str, retried: int = 0) -> None:
         # #28 W16: "busy" = another reconcile held the calendar lock past
         # the wait, so the plan write this run was armed for never reached
         # intervals.icu, and the next trigger can be tomorrow's daily run.
-        # Re-arm (up to 10 times, ~5 min); a timer a newer plan write armed
+        # Re-arm (up to 10 times, ~15 min); a timer a newer plan write armed
         # meanwhile covers it.
         if res.get("error") == "busy" and retried < 10:
             with _icu_push_timer_lock:
@@ -7942,6 +7944,7 @@ def _icu_push_daily_from_sync() -> None:
         import icu_calendar_push
         res = icu_calendar_push.reconcile()
         if res.get("error") == "swept":         # sync went off while it waited
+            _icu_push_last_daily = None         # the day's run did not happen
             return
         _icu_push_note_result(res)
         if res.get("error"):
@@ -8015,7 +8018,7 @@ def api_icu_push(body: "dict | None" = None):
             _icu_push_cancel_pending()      # a pending debounce would re-push
             res = _icp.sweep_all()          # G-A: final forward sweep
             return {"ok": True, "sync_enabled": False, **res}
-        res = _icp.reconcile()
+        res = _icp.reconcile(abort_if_swept=False)
         _icu_push_note_result(res)          # 3.3.1 hotfix (B3b): status parity
         return {"ok": not res.get("error") and not res.get("needs_reconnect"),
                 **res}
@@ -8227,7 +8230,7 @@ def api_icu_races():
         status, body = _icp._http(
             "GET", f"athlete/{athlete_id}/events?oldest={today.isoformat()}"
                    f"&newest={(today + timedelta(days=365)).isoformat()}")
-        if _icp._scope_403(status, body):
+        if _icp._scope_403(status, body) or status == 401:   # 401: token revoked/expired
             return {"needs_reconnect": True}
         if status == 0:
             return {"error": "network"}
@@ -17513,7 +17516,9 @@ async def api_ride_import(
 
     # v1.0.3 — best-effort auto-reforecast: a FIT import = 1 new ride.
     # Helper swallows all exceptions; the import response stays unchanged.
-    _maybe_auto_reforecast("default", 1)
+    # Off the event loop: it waits for the plan lock (3.13.0 grill).
+    from starlette.concurrency import run_in_threadpool
+    await run_in_threadpool(_maybe_auto_reforecast, "default", 1)
 
     return {
         "ride_id": ride_id,

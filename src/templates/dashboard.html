@@ -12688,12 +12688,18 @@ function icuRacesApply() {
     .map(sel => ({race: _icuRaces[+sel.dataset.i], pick: sel.value}))
     .filter(p => p.race);
   const goal = (picks.find(p => p.pick === 'A') || {}).race || null;
+  // The plan's goal day, picked here or already in the builder: an event plan
+  // ends on it, so a B/C race after it has no week.
+  const g0 = document.getElementById('plan-goal');
+  const goalDate = goal ? goal.date
+    : ((g0 && _isEventGoal(g0.value) && (document.getElementById('plan-edate') || {}).value) || null);
   if (goal) {
     const g = document.getElementById('plan-goal');
     if (g && !_isEventGoal(g.value)) { g.value = 'event'; togglePlanFields(); }
     document.getElementById('plan-edate').value = goal.date;
     document.getElementById('plan-ename').value = goal.name || '';
-    if (goal.distance_km) document.getElementById('plan-ekm').value = goal.distance_km;
+    // No distance in intervals.icu: clear the old event's, don't keep it.
+    document.getElementById('plan-ekm').value = goal.distance_km || '';
     _syncPlanDateToWeeks();
     // A race can't be the goal and a B/C race too.
     document.querySelectorAll('#plan-bc-rows .plan-bc-row').forEach(function (row) {
@@ -12706,7 +12712,7 @@ function icuRacesApply() {
   picks.forEach(function (p) {
     if ((p.pick !== 'B' && p.pick !== 'C') || taken.has(p.race.date)) return;
     // An event plan ends on its goal day: a race after it has no week here.
-    if (goal && p.race.date > goal.date) { later++; return; }
+    if (goalDate && p.race.date > goalDate) { later++; return; }
     addBcRaceRow({date: p.race.date, priority: p.pick, name: p.race.name,
                   event_km: p.race.distance_km || 0});
     taken.add(p.race.date);
@@ -12859,6 +12865,10 @@ async function generatePlan(opts) {
     body.event_date = $('plan-tdate').value || null;
     // F3 — a non-event plan can still target intermediate B/C races. Attach them
     // as events[] (no A event); the backend applies the B/C mini-tapers.
+    const _bc = readBcRaces();
+    if (_bc.length) body.events = _bc;
+  } else if (body.goal === 'general') {
+    // B/C races were shown for this goal but never sent (3.13.0 grill).
     const _bc = readBcRaces();
     if (_bc.length) body.events = _bc;
   } else if (body.goal === 'continuous') {
@@ -16229,6 +16239,8 @@ function renderFtpSourceBadge(source, sourceDate) {
   let bg = 'var(--surface2)', fg = 'var(--text2)', border = 'var(--border)';
   if (/^tested_coggan/i.test(source)) { label = 'Tested Coggan 20min'; bg = 'rgba(34,197,94,0.15)'; fg = '#22c55e'; border = '#22c55e'; }
   else if (/^tested_ramp/i.test(source)) { label = 'Tested Ramp'; bg = 'rgba(34,197,94,0.15)'; fg = '#22c55e'; border = '#22c55e'; }
+  else if (/^tested_cp/i.test(source)) { label = 'Tested CP'; bg = 'rgba(34,197,94,0.15)'; fg = '#22c55e'; border = '#22c55e'; }
+  else if (/^tested_sixty/i.test(source)) { label = 'Tested 60min'; bg = 'rgba(34,197,94,0.15)'; fg = '#22c55e'; border = '#22c55e'; }
   else if (/^tested/i.test(source)) { label = 'Tested'; bg = 'rgba(34,197,94,0.15)'; fg = '#22c55e'; border = '#22c55e'; }
   else if (/^eftp/i.test(source) || /^icu/i.test(source)) { label = 'Estimated · ICU'; bg = 'rgba(59,130,246,0.15)'; fg = '#3b82f6'; border = '#3b82f6'; }
   else if (/^manual/i.test(source)) { label = 'Manual'; bg = 'rgba(148,163,184,0.15)'; fg = '#94a3b8'; border = '#94a3b8'; }
