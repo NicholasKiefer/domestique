@@ -115,6 +115,33 @@ from user_home import domestique_home
 # bundled library (always ≥4000 files), never to a rider's custom dir.
 _BUNDLED_WORKOUT_DIR = Path(__file__).parent / "workouts"
 WORKOUT_DIR = _BUNDLED_WORKOUT_DIR
+# 3.13.1: a rider's own folder ADDS workouts to the built-in library instead of
+# replacing it (a replacement folder lacked every workout shipped later, e.g.
+# the CP test). None = built-in only. Set per profile, like WORKOUT_DIR.
+EXTRA_WORKOUT_DIR: "Path | None" = None
+
+
+def is_builtin_library(path) -> bool:
+    """3.13.1: is this folder Domestique's own built-in library (this
+    install's, or a copy of an older one)? The setup wizard saved the built-in
+    path as the rider's folder, so many profiles point at an old install's
+    library. Such a folder is never an *extra* folder: the built-in library of
+    the running app always has its workouts, newer and renamed ones included.
+    Recognised by the overhaul manifest only the built-in library ships."""
+    try:
+        p = Path(path)
+        return (p.resolve() == _BUNDLED_WORKOUT_DIR.resolve()
+                or (p / ".overhaul_manifest.json").is_file())
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def extra_workout_dir_for(path) -> "Path | None":
+    """The rider's folder as an extra library folder, or None when it is not
+    usable or is a built-in library (is_builtin_library)."""
+    if not path or not workout_dir_is_usable(path) or is_builtin_library(path):
+        return None
+    return Path(path)
 
 
 def workout_dir_is_usable(path) -> bool:
@@ -329,7 +356,7 @@ def _compute_workouts_dir_hash() -> str:
     return h.hexdigest()
 
 
-def _read_library_index(count: int, max_mtime: float) -> list[dict] | None:
+def _read_library_index(count: int, max_mtime: float, wd: "Path | None" = None) -> list[dict] | None:
     """v1.10.1 SPEED-INDEX: try the consolidated on-disk row index.
 
     Returns the list of pre-parsed library rows iff
@@ -349,7 +376,7 @@ def _read_library_index(count: int, max_mtime: float) -> list[dict] | None:
     own output; JSON round-trips every field cleanly (Tags=list[str],
     SecondaryFlags=dict, all other fields str/int/float).
     """
-    index_path = WORKOUT_DIR / _LIBRARY_INDEX_FILENAME
+    index_path = (wd or WORKOUT_DIR) / _LIBRARY_INDEX_FILENAME
     if not index_path.exists():
         return None
     try:
@@ -373,7 +400,7 @@ def _read_library_index(count: int, max_mtime: float) -> list[dict] | None:
     return rows
 
 
-def _write_library_index(rows: list[dict], count: int, max_mtime: float) -> None:
+def _write_library_index(rows: list[dict], count: int, max_mtime: float, wd: "Path | None" = None) -> None:
     """v1.10.1 SPEED-INDEX: persist ``rows`` to workouts/.library_index.json.
 
     Called after a full XML parse so the index self-heals when missing/stale.
@@ -381,7 +408,7 @@ def _write_library_index(rows: list[dict], count: int, max_mtime: float) -> None
     bundle) just means the next cold call re-parses — never fatal. Written via
     a tmp file + atomic rename so a concurrent reader never sees a half file.
     """
-    index_path = WORKOUT_DIR / _LIBRARY_INDEX_FILENAME
+    index_path = (wd or WORKOUT_DIR) / _LIBRARY_INDEX_FILENAME
     payload = {
         "schema_version": _INDEX_SCHEMA_VERSION,
         "classifier_version": _CLASSIFIER_VERSION,
@@ -4756,6 +4783,29 @@ def _np_fraction_from_samples(samples: "list[float]") -> float:
 
 
 def load_workout_library() -> list[dict]:
+    """The workout library: every workout of the built-in library (WORKOUT_DIR)
+    plus those in the rider's extra folder (EXTRA_WORKOUT_DIR, 3.13.1) that the
+    built-in one does not have by file name. Rows as _load_library_dir."""
+    rows = _load_library_dir(WORKOUT_DIR)
+    extra = EXTRA_WORKOUT_DIR
+    if extra is None or Path(extra) == WORKOUT_DIR or not workout_dir_is_usable(extra):
+        return rows
+    extra_rows = _load_library_dir(Path(extra))
+    # Same list object while neither part changed, as the one-folder cache.
+    key = (str(WORKOUT_DIR), str(extra))
+    hit = _WORKOUT_LIB_UNION_CACHE.get(key)
+    if hit and hit[0] is rows and hit[1] is extra_rows:
+        return hit[2]
+    have = {r.get("File") for r in rows}
+    union = rows + [r for r in extra_rows if r.get("File") not in have]
+    _WORKOUT_LIB_UNION_CACHE[key] = (rows, extra_rows, union)
+    return union
+
+
+_WORKOUT_LIB_UNION_CACHE: dict = {}
+
+
+def _load_library_dir(wd: Path) -> list[dict]:
     """Scan WORKOUT_DIR (flat) and extract metadata by parsing each ZWO XML.
 
     Returns list of dicts shaped like the legacy rows so that match_zwo()
@@ -4783,15 +4833,15 @@ def load_workout_library() -> list[dict]:
     #   * Slow tier: when the fast validator misses, fall through to the
     #     full glob+max-mtime sweep that catches in-place content edits.
     global _WORKOUT_LIB_CACHE, _WORKOUT_LIB_FAST_VALIDATOR
-    cache_key = str(WORKOUT_DIR)
+    cache_key = str(wd)
 
-    if not WORKOUT_DIR.exists():
+    if not wd.exists():
         return []
 
     # Fast-path: single stat on the workouts directory itself. If it matches
     # the validator stored alongside the cache entry, the cached list is fresh.
     try:
-        dir_mtime = WORKOUT_DIR.stat().st_mtime
+        dir_mtime = wd.stat().st_mtime
     except OSError:
         dir_mtime = 0.0
     fast_key = (_CLASSIFIER_VERSION, dir_mtime)
@@ -4803,7 +4853,7 @@ def load_workout_library() -> list[dict]:
     # Slow-path: enumerate files to compute the precise validator. This
     # catches edits that don't tick the directory's mtime (in-place rewrites
     # of an existing file).
-    zwo_paths = sorted(WORKOUT_DIR.glob("*.zwo"))
+    zwo_paths = sorted(wd.glob("*.zwo"))
     # Hash the (count, max_mtime) — fast and sufficient to detect edits/adds/removes.
     try:
         max_mtime = max((p.stat().st_mtime for p in zwo_paths), default=0.0)
@@ -4825,7 +4875,7 @@ def load_workout_library() -> list[dict]:
     # above, so a stale index can never feed the planner old rows — it just falls
     # through to the parse below. Populate both caches on a hit so repeat calls
     # stay at 0.000s exactly as before.
-    indexed_rows = _read_library_index(len(zwo_paths), max_mtime)
+    indexed_rows = _read_library_index(len(zwo_paths), max_mtime, wd)
     if indexed_rows is not None:
         _WORKOUT_LIB_CACHE[cache_key] = (mtime_hash, indexed_rows)
         _WORKOUT_LIB_FAST_VALIDATOR[cache_key] = fast_key
@@ -5078,7 +5128,7 @@ def load_workout_library() -> list[dict]:
     # Keyed by the same (count, max_mtime) we just validated, so it stays fresh
     # until a *.zwo actually changes. Writing this dotfile does NOT invalidate
     # the index (the validator is over *.zwo, not the dir mtime).
-    _write_library_index(workouts, len(zwo_paths), max_mtime)
+    _write_library_index(workouts, len(zwo_paths), max_mtime, wd)
     # v3.2.0 watertight classifier (A5): facts self-heal shares the index's
     # heal moment — a new/changed *.zwo lands here (count/max_mtime miss →
     # full parse), so computing its facts row inline (~9ms/file, incremental
@@ -5086,7 +5136,7 @@ def load_workout_library() -> list[dict]:
     # row index. Best-effort: a failure only means the per-file lazy heal in
     # workout_facts.get_facts covers it later.
     try:
-        workout_facts.ensure_facts(WORKOUT_DIR, zwo_paths)
+        workout_facts.ensure_facts(wd, zwo_paths)
     except Exception as _wf_e:  # noqa: BLE001
         log.debug("facts self-heal skipped (%s)", _wf_e)
     return workouts

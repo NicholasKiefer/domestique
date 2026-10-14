@@ -419,6 +419,9 @@ _BUNDLED_WORKOUT_DIR = Path(__file__).parent / "workouts"  # bundled workout fil
 _BUNDLED_GPX_DIR     = Path(__file__).parent / "gpx"       # bundled GPX files
 WORKOUT_DIR   = _BUNDLED_WORKOUT_DIR
 GPX_DIR       = _BUNDLED_GPX_DIR
+# 3.13.1: the rider's own folder adds workouts to the built-in library
+# (training_planner.EXTRA_WORKOUT_DIR is its twin). None = built-in only.
+EXTRA_WORKOUT_DIR: "Path | None" = None
 
 # Load user path overrides — check user data dir (packaged) then project dir (dev)
 # Linux-IP D3: apply an override ONLY when the dir exists (mirrors
@@ -432,7 +435,7 @@ for _upf in [_user_data_dir / "user_paths.json", Path(__file__).parent / "user_p
                 _cand = Path(_up["workout_dir"])
                 # v3.11.2: usable (holds .zwo files), not merely existing.
                 if _cand.is_dir() and next(_cand.glob("*.zwo"), None) is not None:
-                    WORKOUT_DIR = _cand
+                    EXTRA_WORKOUT_DIR = tp.extra_workout_dir_for(_cand)
                 else:
                     logging.getLogger("app").error(
                         "E_WORKOUT_DIR_UNUSABLE: user_paths.json workout_dir=%s "
@@ -458,10 +461,11 @@ def active_workout_dir() -> Path:
 
 
 def _workout_file(*parts, base: "Path | None" = None) -> "Path | None":
-    """A workout file from the rider's workout folder, else from the built-in
-    library, which holds every workout. A rider's own folder can predate a
-    file the app ships later (the CP test, 3.13.0). None when neither has it."""
-    for root in (base or active_workout_dir(), _BUNDLED_WORKOUT_DIR):
+    """A workout file from the library: the built-in folder (every workout the
+    app ships), then the rider's extra folder (3.13.1). The built-in one wins a
+    name both have, as in the library list. None when neither has it."""
+    roots = [base or active_workout_dir(), EXTRA_WORKOUT_DIR, _BUNDLED_WORKOUT_DIR]
+    for root in [r for i, r in enumerate(roots) if r is not None and r not in roots[:i]]:
         p = _safe_path(root, *parts)
         if p is not None and p.is_file():
             return p
@@ -491,8 +495,8 @@ def _apply_profile_paths() -> None:
     (same code path); setup_save calls it after writing the profile's
     user_paths.json.
     """
-    global WORKOUT_DIR, GPX_DIR
-    wp: Path = _BUNDLED_WORKOUT_DIR
+    global WORKOUT_DIR, GPX_DIR, EXTRA_WORKOUT_DIR
+    wp: "Path | None" = None
     gp: Path = _BUNDLED_GPX_DIR
     # v3.11.3 multi-profile screen: the 60-s Diagnostics snapshot is per
     # profile (plan readable, pool_health.workout_dir) — drop it on switch so
@@ -527,7 +531,11 @@ def _apply_profile_paths() -> None:
                 gp = Path(gcand)
     except Exception as e:
         log.debug(f"_apply_profile_paths: fell back to bundled dirs: {e}")
-    WORKOUT_DIR = wp
+    # 3.13.1: the built-in library is always the library; the rider's folder
+    # (wp) adds to it.
+    WORKOUT_DIR = _BUNDLED_WORKOUT_DIR
+    EXTRA_WORKOUT_DIR = tp.extra_workout_dir_for(wp)
+    tp.EXTRA_WORKOUT_DIR = EXTRA_WORKOUT_DIR
     GPX_DIR = gp
 CONFIG_PATH   = Path(__file__).parent / "config.py"
 
@@ -973,7 +981,8 @@ def setup_defaults():
 
     return {
         "icu_id": config.ICU_ATHLETE_ID or "",
-        "workout_dir": str(active_workout_dir()) if active_workout_dir().exists() else workout_dir_default,
+        # 3.13.1: the field is the EXTRA folder; the built-in library is always on.
+        "workout_dir": str(EXTRA_WORKOUT_DIR) if EXTRA_WORKOUT_DIR else workout_dir_default,
         "gpx_dir": str(active_gpx_dir()) if active_gpx_dir().exists() else "",
         "weight": config.ATHLETE_WEIGHT_KG,
         "ftp": config.ATHLETE_FTP_W,
@@ -1187,6 +1196,67 @@ def setup_pick_folder():
     t.start()
     t.join(timeout=60)
     return {"path": result["path"]}
+
+
+def _workout_folders_state() -> dict:
+    """3.13.1 Settings: the built-in library and the rider's extra folder."""
+    try:
+        builtin = {p.name for p in _BUNDLED_WORKOUT_DIR.glob("*.zwo")}
+    except OSError:
+        builtin = set()
+    extra = EXTRA_WORKOUT_DIR
+    out = {"builtin": {"count": len(builtin)}, "extra": None}
+    if extra is not None:
+        try:
+            names = [p.name for p in Path(extra).glob("*.zwo")]
+        except OSError:
+            names = []
+        out["extra"] = {"path": str(extra), "files": len(names),
+                        "added": sum(1 for n in names if n not in builtin)}
+    return out
+
+
+@app.get("/api/settings/workout-folders")
+def api_workout_folders():
+    return _workout_folders_state()
+
+
+@app.post("/api/settings/workout-folders")
+def api_set_extra_workout_folder(body: dict):
+    """Set or clear (extra_dir "") the active profile's extra workouts folder.
+    Its .zwo files join the built-in library; the built-in one is always on."""
+    from profile_manager import ProfileManager
+    pm = ProfileManager.get()
+    if pm.active_id is None:
+        return JSONResponse({"error": "No active profile."}, 409)
+    raw = str((body or {}).get("extra_dir") or "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        if not _setup_path_allowed(p):
+            return JSONResponse({"error": "Choose a folder inside your home folder."}, 400)
+        if not tp.workout_dir_is_usable(p):
+            return JSONResponse({"error": "That folder has no .zwo workout files."}, 400)
+        if tp.is_builtin_library(p):
+            return JSONResponse({"error": "That is Domestique's built-in library, which is always included. Choose a folder with your own workouts."}, 400)
+    paths_file = pm.active_dir / "user_paths.json"
+    try:
+        paths = json.loads(paths_file.read_text(encoding="utf-8"))
+        if not isinstance(paths, dict):
+            paths = {}
+    except (OSError, json.JSONDecodeError):
+        paths = {}
+    if raw:
+        paths["workout_dir"] = str(Path(raw).expanduser())
+    else:
+        paths.pop("workout_dir", None)
+    tmp = paths_file.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(paths, indent=2), encoding="utf-8")
+    tmp.replace(paths_file)
+    pm.apply_training_dirs()
+    _apply_profile_paths()
+    clear_cache()
+    _log.info("EVENT=extra_workout_folder set=%s", bool(raw))
+    return _workout_folders_state()
 
 
 # Guards against concurrent wizard submissions clobbering each other.
@@ -5422,12 +5492,29 @@ _LIBRARY_TAGS_CACHE: tuple[float, list[str]] | None = None
 _LIBRARY_TAGS_LOCK = threading.Lock()
 
 
+def _library_zwo_paths() -> list[Path]:
+    """Every .zwo of the library: the built-in folder, then the rider's extra
+    folder's files with a name the built-in one lacks (3.13.1)."""
+    try:
+        paths = sorted(active_workout_dir().glob("*.zwo"))
+    except OSError:
+        paths = []
+    extra = EXTRA_WORKOUT_DIR
+    if extra is not None and Path(extra) != active_workout_dir():
+        have = {p.name for p in paths}
+        try:
+            paths += [p for p in sorted(Path(extra).glob("*.zwo")) if p.name not in have]
+        except OSError:
+            pass
+    return paths
+
+
 def _compute_library_tags() -> list[str]:
     """Scan all ZWO files for distinct tags. Returns sorted unique list."""
     if not active_workout_dir().exists():
         return []
     seen: set[str] = set()
-    for zwo_path in active_workout_dir().glob("*.zwo"):
+    for zwo_path in _library_zwo_paths():
         try:
             tree = ET.parse(zwo_path)
         except (ET.ParseError, OSError):
@@ -5446,7 +5533,7 @@ def _get_library_tags_cached() -> list[str]:
     """Return cached distinct tag list, refreshing on dir mtime drift."""
     global _LIBRARY_TAGS_CACHE
     try:
-        mtimes = [p.stat().st_mtime for p in active_workout_dir().glob("*.zwo")]
+        mtimes = [p.stat().st_mtime for p in _library_zwo_paths()]
     except OSError:
         mtimes = []
     sig = max(mtimes) if mtimes else 0.0
@@ -5499,7 +5586,7 @@ def _build_library_rows() -> list[dict]:
     _content_classifications = tp._load_content_classifications()
     _CONTENT_TO_PROTOCOL = tp._CONTENT_TO_PROTOCOL
 
-    for zwo_path in sorted(active_workout_dir().glob("*.zwo")):
+    for zwo_path in _library_zwo_paths():
         scan = _scan_zwo_for_library(zwo_path)
         if not scan:
             continue
@@ -5618,7 +5705,15 @@ def _get_library_rows_cached() -> list[dict]:
                       if e.name.endswith(".zwo") and not e.name.startswith(".")]
     except OSError:
         mtimes = []
-    sig = (str(active_workout_dir()), max(mtimes) if mtimes else 0.0, len(mtimes))
+    extra = EXTRA_WORKOUT_DIR
+    if extra is not None:
+        try:
+            with os.scandir(extra) as it:
+                mtimes += [e.stat().st_mtime for e in it
+                           if e.name.endswith(".zwo") and not e.name.startswith(".")]
+        except OSError:
+            pass
+    sig = (str(active_workout_dir()), str(extra), max(mtimes) if mtimes else 0.0, len(mtimes))
     with _LIBRARY_ROWS_LOCK:
         if _LIBRARY_ROWS_CACHE and _LIBRARY_ROWS_CACHE[0] == sig:
             return _LIBRARY_ROWS_CACHE[1]
@@ -20447,6 +20542,9 @@ def api_diag_health(request: Request):
                 "workout_dir": str(tp.WORKOUT_DIR),
                 "workout_dir_is_bundled":
                     tp.WORKOUT_DIR == tp._BUNDLED_WORKOUT_DIR,
+                # 3.13.1: the rider's folder adds to the built-in library.
+                "extra_workout_dir": (str(tp.EXTRA_WORKOUT_DIR)
+                                      if tp.EXTRA_WORKOUT_DIR else None),
                 "collapse_reason": tp._pool_collapse_reason(_pi, lib) or None,
             }
         except Exception as e:

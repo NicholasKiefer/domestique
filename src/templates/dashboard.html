@@ -1429,6 +1429,16 @@ details > summary:hover::before { color: var(--accent); }
   text-align: left; z-index: 10000; box-shadow: 0 4px 14px rgba(0,0,0,0.35);
   pointer-events: none;
 }
+/* 3.13.1 Settings: workout library card */
+.wl-row { display:flex; align-items:center; gap:12px; padding:10px 12px; border:1px solid var(--border); border-radius:8px; margin-bottom:8px; flex-wrap:wrap; }
+.wl-icon { font-size:20px; line-height:1; }
+.wl-main { flex:1; min-width:180px; }
+.wl-title { font-size:13px; font-weight:600; }
+.wl-sub { font-size:12px; color:var(--text2); margin-top:2px; }
+.wl-path { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:11px; color:var(--text3); margin-top:4px; word-break:break-all; }
+.wl-badge { font-size:11px; font-weight:600; color:var(--green,#22c55e); border:1px solid var(--green,#22c55e); border-radius:999px; padding:2px 8px; white-space:nowrap; }
+.wl-actions { display:flex; gap:6px; flex-wrap:wrap; }
+.wl-manual { padding:0 2px 6px; }
 </style>
 <script src="/static/vendor/chart.umd.min.js"></script>
 <script src="/static/js/icu-link-reasons.js"></script>
@@ -3273,6 +3283,39 @@ window.addEventListener('unhandledrejection', function(e) {
       <button class="btn" onclick="runSync(this)">Sync Now</button>
       <span id="sync-result" style="font-size:12px;color:var(--green);margin-left:8px;display:none;"></span>
     </div>
+  </div>
+
+  <!-- 3.13.1: the workout library = the built-in library + an optional extra folder -->
+  <div class="card" style="margin-top:12px;" id="workout-library-card">
+    <h3>Workout library</h3>
+    <div class="wl-row">
+      <div class="wl-icon" aria-hidden="true">&#128218;</div>
+      <div class="wl-main">
+        <div class="wl-title">Built-in library</div>
+        <div class="wl-sub" id="wl-builtin">Every workout that comes with Domestique, including the FTP and CP tests.</div>
+      </div>
+      <span class="wl-badge">Always on</span>
+    </div>
+    <div class="wl-row">
+      <div class="wl-icon" aria-hidden="true">&#128193;</div>
+      <div class="wl-main">
+        <div class="wl-title">Your extra workouts</div>
+        <div class="wl-sub" id="wl-extra">Add a folder with your own .zwo files. They join the built-in library; nothing is copied or changed.</div>
+        <div class="wl-path" id="wl-extra-path" style="display:none;"></div>
+      </div>
+      <div class="wl-actions">
+        <button type="button" class="btn btn-sm" id="wl-choose" onclick="wlChooseFolder(this)">Choose folder&hellip;</button>
+        <button type="button" class="btn btn-sm" id="wl-remove" style="display:none;" onclick="wlSetExtra('')">Remove</button>
+      </div>
+    </div>
+    <div id="wl-manual" class="wl-manual" style="display:none;">
+      <label for="wl-manual-path" class="wl-sub">The folder picker could not open here. Type the folder's path:</label>
+      <div style="display:flex;gap:6px;margin-top:4px;">
+        <input type="text" id="wl-manual-path" placeholder="~/Documents/Workouts" style="flex:1;min-width:0;">
+        <button type="button" class="btn btn-sm" onclick="wlSetExtra(document.getElementById('wl-manual-path').value)">Use folder</button>
+      </div>
+    </div>
+    <div id="wl-status" class="wl-sub" role="status" aria-live="polite" style="margin-top:6px;"></div>
   </div>
 
   <!-- Connections (Intervals.icu) -->
@@ -16030,7 +16073,60 @@ async function viewVersion() {
   } catch(e) { showToast('Version check failed: ' + e.message, 4000); }
 }
 
+// ═══ 3.13.1: workout library — built-in + an optional extra folder ═══════════
+function _wlRender(st) {
+  const b = document.getElementById('wl-builtin');
+  if (b && st.builtin) b.textContent = `${st.builtin.count.toLocaleString()} workouts that come with Domestique, including the FTP and CP tests.`;
+  const ex = st.extra;
+  const sub = document.getElementById('wl-extra'), path = document.getElementById('wl-extra-path');
+  const choose = document.getElementById('wl-choose'), remove = document.getElementById('wl-remove');
+  if (!sub) return;
+  if (ex) {
+    sub.textContent = ex.added === 1 ? '1 workout added to the library.'
+      : `${ex.added} workouts added to the library` + (ex.files > ex.added ? ` (${ex.files - ex.added} already in the built-in one).` : '.');
+    path.textContent = ex.path; path.style.display = '';
+    choose.innerHTML = 'Change folder&hellip;'; remove.style.display = '';
+  } else {
+    sub.textContent = 'Add a folder with your own .zwo files. They join the built-in library; nothing is copied or changed.';
+    path.style.display = 'none';
+    choose.innerHTML = 'Choose folder&hellip;'; remove.style.display = 'none';
+  }
+}
+async function wlRefresh() {
+  try { _wlRender(await (await fetch('/api/settings/workout-folders')).json()); } catch (e) {}
+}
+async function wlChooseFolder(btn) {
+  const label = btn.innerHTML;
+  btn.disabled = true; btn.textContent = 'Opening…';
+  let d = {};
+  try { d = await (await fetch('/api/setup/pick-folder')).json(); } catch (e) {}
+  btn.disabled = false; btn.innerHTML = label;
+  if (d && d.path) { await wlSetExtra(d.path); return; }
+  // No dialog here (or it was cancelled): offer typing the path instead.
+  const m = document.getElementById('wl-manual');
+  if (m) m.style.display = '';
+}
+async function wlSetExtra(path) {
+  const status = document.getElementById('wl-status');
+  let r, d = {};
+  try {
+    r = await fetch('/api/settings/workout-folders', {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({extra_dir: path || ''})});
+    d = await r.json();
+  } catch (e) { d = {error: 'Could not save the folder — try again.'}; }
+  if (!r || !r.ok || d.error) {
+    if (status) { status.textContent = d.error || 'Could not save the folder.'; status.style.color = 'var(--red,#ef4444)'; }
+    return d;
+  }
+  if (status) status.textContent = '';
+  const m = document.getElementById('wl-manual');
+  if (m) m.style.display = 'none';
+  _wlRender(d);
+  showToast(path ? 'Extra workouts added to your library.' : 'Extra workouts folder removed; the built-in library stays.', 4000, 'success');
+  return d;
+}
 async function loadSettings() {
+  wlRefresh();
   const d = await (await getResource('/api/settings')).json();
   // Expose FTP globally so workout library mini SVGs use correct zone colors
   window._athleteFtp = d.ftp || 250;

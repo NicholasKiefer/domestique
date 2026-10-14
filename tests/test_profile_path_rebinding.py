@@ -56,8 +56,10 @@ class ProfilePathRebindingTests(unittest.TestCase):
         this test drove the function directly.
         """
         src = inspect.getsource(app._apply_profile_paths)
-        self.assertIn("global WORKOUT_DIR, GPX_DIR", src)
-        self.assertIn("WORKOUT_DIR = wp", src)
+        self.assertIn("global WORKOUT_DIR, GPX_DIR, EXTRA_WORKOUT_DIR", src)
+        # 3.13.1: the built-in library stays; the profile's folder is extra.
+        self.assertIn("WORKOUT_DIR = _BUNDLED_WORKOUT_DIR", src)
+        self.assertIn("EXTRA_WORKOUT_DIR = tp.extra_workout_dir_for(wp)", src)
         self.assertIn("GPX_DIR = gp", src)
 
     def test_no_module_binds_the_value_instead_of_the_name(self):
