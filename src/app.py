@@ -457,6 +457,17 @@ def active_workout_dir() -> Path:
     return WORKOUT_DIR
 
 
+def _workout_file(*parts, base: "Path | None" = None) -> "Path | None":
+    """A workout file from the rider's workout folder, else from the built-in
+    library, which holds every workout. A rider's own folder can predate a
+    file the app ships later (the CP test, 3.13.0). None when neither has it."""
+    for root in (base or active_workout_dir(), _BUNDLED_WORKOUT_DIR):
+        p = _safe_path(root, *parts)
+        if p is not None and p.is_file():
+            return p
+    return None
+
+
 def active_gpx_dir() -> Path:
     """The active profile's GPX directory, resolved at call time.
 
@@ -5858,7 +5869,7 @@ def download_workout_by_id(filename: str, cap: int = Query(0)):
     reps to the rider's measured-power envelope. A no-op cap keeps the plain
     FileResponse (byte-identical to disk).
     """
-    path = _safe_path(active_workout_dir(), filename)
+    path = _workout_file(filename)
     if not path or not path.exists():
         return JSONResponse({"error": "not found"}, 404)
     # v1.6.4: media_type "application/octet-stream" (was "application/xml")
@@ -5894,9 +5905,9 @@ def api_workout_detail(category: str, filename: str, view: str | None = Query(No
     as the settings gate); downloads follow the same param so what you see
     is what the head unit gets."""
     # Flat layout first, legacy category/file fallback
-    path = _safe_path(active_workout_dir(), filename)
+    path = _workout_file(filename)
     if not path or not path.exists():
-        path = _safe_path(active_workout_dir(), category, filename)
+        path = _workout_file(category, filename)
     if not path or not path.exists():
         return JSONResponse({"error": "not found"}, 404)
     try:
@@ -6095,9 +6106,9 @@ async def api_bulk_segments(request: Request):
         else:
             cat, fname = "", f
         # Flat lookup first; fall back to legacy category subdir
-        path = _safe_path(active_workout_dir(), fname) if fname else None
+        path = _workout_file(fname) if fname else None
         if (not path or not path.exists()) and cat:
-            path = _safe_path(active_workout_dir(), cat, fname)
+            path = _workout_file(cat, fname)
         if not path or not path.exists():
             continue
         try:
@@ -7119,7 +7130,7 @@ def download_zwo_flat(filename: str, outdoor: int = Query(0),
     task #24: ``cap=1`` (PROMPT APPROVE) or the profile "on" toggle caps short
     reps to the rider's measured-power envelope for THIS download only.
     """
-    path = _safe_path(active_workout_dir(), filename)
+    path = _workout_file(filename)
     if not path or not path.exists():
         return JSONResponse({"error": "not found"}, 404)
     return _zwo_download_response(path, filename, outdoor, transit_min, spin_min,
@@ -7134,9 +7145,9 @@ def download_zwo(category: str, filename: str, outdoor: int = Query(0),
     G1 (v2.1): ``outdoor=1`` adds an off-plan transit warmup + spin-home cooldown.
     task #24: ``cap=1``/on toggle caps short reps to measured power."""
     # Flat layout first, legacy category/file fallback
-    path = _safe_path(active_workout_dir(), filename)
+    path = _workout_file(filename)
     if not path or not path.exists():
-        path = _safe_path(active_workout_dir(), category, filename)
+        path = _workout_file(category, filename)
     if not path or not path.exists():
         return JSONResponse({"error": "not found"}, 404)
     return _zwo_download_response(path, filename, outdoor, transit_min, spin_min,
@@ -12836,7 +12847,7 @@ def build_fit_workout_bytes(session_type: str, duration_min: int,
 
     ftp = config.ATHLETE_FTP_W
     if zwo_file:
-        zwo_path = _safe_path(active_workout_dir(), zwo_file)
+        zwo_path = _workout_file(zwo_file)
         if not zwo_path or not zwo_path.exists():
             raise FileNotFoundError(f"ZWO file not found: {zwo_file}")
         # task #24: cap the ZWO text pre-transcode when active + power FIT.
@@ -16776,6 +16787,13 @@ async def api_plan_ftp_test_type(request: Request):
             pref_file, want_dur, nominal_tss = _FTP_TEST_PREFERRED_FILE[test_type]
             cands = [w for w in tp.load_workout_library()
                      if _ftp_test_family(w.get("File", "")) == test_type]
+            if not cands and _workout_file(pref_file):
+                # The rider's own folder lacks this protocol: the built-in
+                # library has it (found there by _workout_file everywhere).
+                _m = re.search(r"<name>(.*?)</name>",
+                               _workout_file(pref_file).read_text(encoding="utf-8"))
+                cands = [{"File": pref_file, "Name": _m.group(1) if _m else pref_file,
+                          "Duration(min)": want_dur, "TSS": nominal_tss}]
             if not cands:
                 return JSONResponse({"error": f"no {test_type} workout in library"}, 404)
             pick = next((w for w in cands if w.get("File") == pref_file), None)

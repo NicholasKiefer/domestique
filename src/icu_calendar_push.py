@@ -271,7 +271,7 @@ def _build_event(s: dict, ext_id: str, pm, classifications: dict,
     zwo_file = (s.get("zwo_file") or "").strip()
     if not zwo_file:                        # unmatched slot (no ZWO to attach)
         return None, "unmatched"
-    zwo_path = _app._safe_path(workout_dir, zwo_file)
+    zwo_path = _app._workout_file(zwo_file, base=workout_dir)
     if not zwo_path or not zwo_path.exists():
         return None, "file_missing"
     name = _display_name(s, classifications)
