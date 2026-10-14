@@ -656,14 +656,10 @@ def _best_window_clear_of(powers: list, dur: int, taken: list, gap: int):
     return best, best_i
 
 
-def cp_test_ftp(power_series) -> "dict | None":
-    """Score a CP test ride: the best 12-, 7- and 3-min efforts, each a
-    separate window, fitted to P = W'/t + CP (least squares). FTP = CP.
-
-    Correct or silent: None unless the efforts get harder as they get
-    shorter, the fit is near-perfect (R² >= CP_TEST_R2_MIN) and W' is
-    physiological (5-40 kJ, the profile's own bounds). Recognition is by
-    name only, so a ride is scored only when the rider meant to ride it."""
+def _cp_test_efforts(power_series) -> "dict | None":
+    """{duration_s: (mean_w, start_s)} for the best 12-, 7- and 3-min
+    windows, each clear of the others, when they get harder as they get
+    shorter -- the shape of a CP test. None otherwise."""
     powers = [float(p or 0) for p in (power_series or [])]
     taken, eff = [], {}
     for dur in CP_TEST_EFFORTS_S:
@@ -673,8 +669,21 @@ def cp_test_ftp(power_series) -> "dict | None":
         eff[dur] = (mean, start)
         taken.append((start, start + dur))
     p12, p7, p3 = (eff[d][0] for d in CP_TEST_EFFORTS_S)
-    if not (p3 > p7 > p12 > 0):
+    return eff if p3 > p7 > p12 > 0 else None
+
+
+def cp_test_ftp(power_series) -> "dict | None":
+    """Score a CP test ride: the best 12-, 7- and 3-min efforts, each a
+    separate window, fitted to P = W'/t + CP (least squares). FTP = CP.
+
+    Correct or silent: None unless the efforts get harder as they get
+    shorter, the fit is near-perfect (R² >= CP_TEST_R2_MIN) and W' is
+    physiological (5-40 kJ, the profile's own bounds). Recognition is by
+    name only, so a ride is scored only when the rider meant to ride it."""
+    eff = _cp_test_efforts(power_series)
+    if eff is None:
         return None
+    p12, p7, p3 = (eff[d][0] for d in CP_TEST_EFFORTS_S)
     xs = [1.0 / d for d in CP_TEST_EFFORTS_S]
     ys = [eff[d][0] for d in CP_TEST_EFFORTS_S]
     mx, my = sum(xs) / 3, sum(ys) / 3
@@ -926,10 +935,11 @@ def evaluate_ftp_test(power_series, cadence_series=None,
     if not kind:
         return None
     if (kind == "coggan_20min" and not _hint_test_kind(filename_hint)
-            and cp_test_ftp(power_series) is not None):
-        # A ride with the CP test's three efforts, recognised by shape only
-        # (no name): the 20-min calculator would read its 12-min effort plus
-        # rest as the 20-min block, ~17% low. Ambiguous, so silent.
+            and _cp_test_efforts(power_series) is not None):
+        # A ride shaped like the CP test's three efforts, recognised by shape
+        # only (no name): the 20-min calculator would read its 12-min effort
+        # plus rest as the 20-min block, ~17% low. Silent on the shape, not
+        # on whether the CP fit accepts it (3.13.0 grill).
         return None
     fallback = False
     if kind == "coggan_20min":

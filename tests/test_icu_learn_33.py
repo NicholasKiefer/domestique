@@ -74,12 +74,17 @@ def test_a_drag_onto_a_rest_day_is_learned_and_the_event_rekeyed(env, echo):
     _one_event_per_session(env)
 
 
-def test_a_drag_to_today_is_learned(env):
+def test_a_drag_to_today_is_held_and_keeps_the_riders_event(env):
+    """Grill r2 M-B: re-keying a move to today deleted the event the rider
+    may already have ridden (intervals.icu pairs the ride with it)."""
     _seed(env, _week(thu="steady.zwo"))
-    env.fk.drag(_eid(env, D["thu"]), D["mon"])            # MON is today
+    thu0 = _eid(env, D["thu"])
+    env.fk.drag(thu0, D["mon"])                           # MON is today
+    paired = env.fk._one(thu0)["id"]
+    before = _plan()
     r = icp.reconcile()
-    assert [(m["from"], m["to"]) for m in r["learned"]] == [(D["thu"], D["mon"])]
-    assert env.fk.files_on() == {D["mon"]: ["steady"]}
+    assert r["learned"] == [] and r["held"] == 1 and _plan() == before
+    assert paired in {e.get("id") for e in env.fk.events}
 
 
 @pytest.mark.parametrize("why,setup", [
@@ -112,7 +117,7 @@ def test_an_unavailable_or_race_day_is_not_learned(env, mark):
     _seed(env, ss)
     plan = _plan()
     if mark == "zero_hours":
-        plan["availability"] = {D["fri"]: 0}
+        plan["availability"] = {D["fri"]: {"hours": 0, "type": "holiday"}}   # the stored shape
     elif mark == "period":
         plan["unavailable_periods"] = [{"start": D["thu"], "end": D["sat"], "type": "holiday"}]
     else:
@@ -158,7 +163,7 @@ def test_a_skipped_workout_moved_in_icu_is_not_learned(env):
 def test_the_move_learned_is_pinned_like_a_drag(env):
     """It keeps its length when the day's hours change (#27 O4) because it
     is the rider's move; the auto-reschedule never moves it back."""
-    _seed(env, _week(wed="steady.zwo"))
+    _seed(env, _week(mon="sweet.zwo", wed="steady.zwo"))
     env.fk.drag(_eid(env, D["wed"]), D["fri"])
     icp.reconcile()
     fri, = _on(D["fri"])
@@ -175,6 +180,111 @@ icuPushToastFromResult({pushed: 1, updated: 0, deleted: 1, skipped: [], held: 0,
                         learned: [{from: '2026-10-21', to: '2026-10-23', name: 'Z2'}]}, 'Pushed to intervals.icu');
 const want = ['Pushed to intervals.icu: 1 new · 1 removed · 1 workout moved in your plan to match intervals.icu'];
 if (JSON.stringify(seen) !== JSON.stringify(want)) throw new Error(JSON.stringify(seen));
+console.log('OK');
+"""
+    _run_node(harness)
+
+
+
+def _files_by_day():
+    return {x["day"]: x.get("zwo_file") for w in _plan()["weeks"] for x in w["sessions"]
+            if x.get("zwo_file")}
+
+
+def test_two_moves_onto_the_same_rest_day_learn_neither(env):
+    """Grill r2 M-A: the second move hit a training day and swapped."""
+    _seed(env, _week(mon="vo2.zwo", wed="steady.zwo", thu="sweet.zwo", sat="vo2.zwo"))
+    env.fk.drag(_eid(env, D["wed"]), D["fri"])
+    env.fk.drag(_eid(env, D["thu"]), D["fri"])
+    before = _plan()
+    r = icp.reconcile()
+    assert r["learned"] == [] and _plan() == before and r["held"] == 2
+
+
+def test_a_profile_switch_during_the_read_never_writes_the_other_plan(env, monkeypatch):
+    """Grill r2 H-B: rider A's move was written into rider B's plan."""
+    _seed(env, _week(wed="steady.zwo"))
+    pid_a = env.pid
+    pid_b = env.pm.create_profile("Other rider")
+    env.pm.switch(pid_b)
+    _write_plan(_week(wed="steady.zwo"))
+    b_path = Path(tp.PLAN_DIR) / "current_plan.json"
+    b_before = b_path.read_text()
+    env.pm.switch(pid_a)
+    a_path = Path(tp.PLAN_DIR) / "current_plan.json"
+    a_before = a_path.read_text()
+    env.fk.drag(_eid(env, D["wed"]), D["fri"])
+    fk, state = env.fk, {"switched": False}
+
+    def http(method, path, payload=None, timeout=30.0):
+        if method == "GET" and not state["switched"]:
+            state["switched"] = True
+            env.pm.switch(pid_b)
+        return fk(method, path, payload, timeout)
+
+    monkeypatch.setattr(icp, "_http", http)
+    r = icp.reconcile()
+    assert r["learned"] == []
+    assert b_path.read_text() == b_before and a_path.read_text() == a_before
+
+
+class _ShiftedFakeICU(WindowedFakeICU):
+    """Fact F2 false: every date read back one day late."""
+    def __call__(self, method, path, payload=None, timeout=30.0):
+        status, body = super().__call__(method, path, payload, timeout)
+        if method == "GET" and status == 200:
+            rows = json.loads(body)
+            for r in rows:
+                d = str(r.get("start_date_local") or "")
+                if len(d) >= 10:
+                    r["start_date_local"] = (date.fromisoformat(d[:10]) + timedelta(days=1)).isoformat() + d[10:]
+            body = json.dumps(rows).encode()
+        return status, body
+
+
+def test_one_moved_event_of_one_is_not_learned(env):
+    """With a single event of ours a date shift and a move look the same:
+    nothing is learned, the move is held."""
+    _seed(env, _week(wed="steady.zwo"))
+    env.fk.drag(_eid(env, D["wed"]), D["fri"])
+    r = icp.reconcile()
+    assert r["learned"] == [] and r["held"] == 1
+
+
+def test_a_date_read_back_shifted_never_walks_a_workout(env, monkeypatch):
+    """Grill r2 M-C: with fewer than 3 events the guard never fired and the
+    workout walked one day per run."""
+    env.fk = _ShiftedFakeICU()
+    monkeypatch.setattr(icp, "_http", env.fk)
+    _write_plan(_week(tue="steady.zwo", sat="sweet.zwo"))
+    days = []
+    for _ in range(4):
+        icp.reconcile()
+        days.append(next(d for d, f in _files_by_day().items() if f == "steady.zwo"))
+    assert days == [D["tue"]] * 4
+
+
+def test_a_session_the_rider_placed_is_not_moved_again(env):
+    """A learned (or dragged) session is user_moved; a later intervals.icu
+    move of it stays held instead of being learned again."""
+    _seed(env, _week(mon="sweet.zwo", tue="vo2.zwo", wed="steady.zwo"))
+    env.fk.drag(_eid(env, D["wed"]), D["fri"])
+    assert len(icp.reconcile()["learned"]) == 1
+    env.fk.drag(_eid(env, D["fri"]), D["sat"])
+    before = _plan()
+    r = icp.reconcile()
+    assert r["learned"] == [] and _plan() == before and r["held"] == 1
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_a_failed_push_after_learning_says_the_plan_changed():
+    """Grill r2 L1: "nothing was changed" was wrong; the plan had moved."""
+    src = DASHBOARD.read_text(encoding="utf-8")
+    harness = _extract_js_function(src, "icuPushToastFromResult") + """
+const seen = [];
+global.showToast = (m) => seen.push(m);
+icuPushToastFromResult({error: 'http_500', learned: [{from: 'a', to: 'b'}]}, 'Pushed');
+if (!seen[0].startsWith('Your plan now follows 1 move you made in intervals.icu')) throw new Error(seen[0]);
 console.log('OK');
 """
     _run_node(harness)

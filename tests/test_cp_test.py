@@ -62,7 +62,9 @@ def _zwo_shaped_cp_ride(cp=250.0, wp=20000.0, old_ftp=240):
 def test_a_cp_ride_without_its_name_is_silent_not_a_20min_test(hint):
     """Grill H1: the 20-min calculator read the 12-min effort plus rest as
     its block, ~17% low. A ride that only looks like a CP test is silent."""
-    for ride in (_cp_ride(), _zwo_shaped_cp_ride()):
+    faded = _zwo_shaped_cp_ride()
+    faded[-660:-480] = [330] * 180                 # a 3-min effort below max (grill r2 M4)
+    for ride in (_cp_ride(), _zwo_shaped_cp_ride(), faded, _ride(278, 298, 320)):
         assert fe.evaluate_ftp_test(ride, filename_hint=hint, prior_ftp=240) is None
 
 

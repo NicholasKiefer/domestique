@@ -16766,6 +16766,13 @@ function icuPushToastFromResult(r, verb) {
     return;
   }
   if (r.error) {
+    const nl = (r.learned || []).length;
+    if (nl) {
+      // #33: the plan already followed the moves; only the calendar update failed.
+      showToast(`Your plan now follows ${nl} move${nl === 1 ? '' : 's'} you made in intervals.icu, but the calendar update failed — try again in a moment.`, 7000, 'warning');
+      if (typeof loadPlan === 'function') { try { loadPlan(); } catch (_) {} }
+      return;
+    }
     showToast("Couldn't reach intervals.icu — nothing was changed. Try again in a moment.", 6000, 'error');
     return;
   }

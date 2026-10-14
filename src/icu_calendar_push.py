@@ -188,9 +188,13 @@ def _http_error_detail(step: str, status: int, body: bytes) -> str:
 
 # ── plan → desired events ────────────────────────────────────────────────────
 
-def _load_plan() -> dict | None:
+def _plan_path() -> Path:
     import training_planner as tp
-    p = Path(getattr(tp, "PLAN_DIR", domestique_home() / "plans")) / "current_plan.json"
+    return Path(getattr(tp, "PLAN_DIR", domestique_home() / "plans")) / "current_plan.json"
+
+
+def _load_plan(p: "Path | None" = None) -> dict | None:
+    p = p or _plan_path()
     try:
         plan = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, ValueError):
@@ -730,8 +734,13 @@ def _day_unavailable(plan: dict, day_iso: str) -> bool:
     avail = plan.get("availability")
     if isinstance(avail, dict):
         v = avail.get(day_iso)
-        if isinstance(v, (int, float)) and not isinstance(v, bool) and v <= 0:
-            return True
+        if isinstance(v, dict):             # the stored shape: {hours, type}
+            v = v.get("hours")
+        try:
+            if v is not None and not isinstance(v, bool) and float(v) <= 0:
+                return True
+        except (TypeError, ValueError):
+            pass
     for per in plan.get("unavailable_periods") or []:
         if isinstance(per, dict) and str(per.get("start") or "") <= day_iso <= str(per.get("end") or ""):
             return True
@@ -744,12 +753,17 @@ def _learnable_moves(held: dict, existing: list, plan: dict, today: date,
     them in Domestique: [(external_id, from_day, to_day)].
 
     Only the plain case, everything else stays held (#28 step 1): one event
-    under the id (never a copy), both days today or later and in the same
-    week, the day it left holds exactly that one pending workout, and the
-    day it went to is a rest, empty or vacated day the rider has not marked
-    unavailable and that is no race. A move onto a training day is never
+    under the id (never a copy), from today or later to a day after today in
+    the same week, the day it left holds exactly that one pending workout
+    the rider has not placed already, and the day it went to is a rest,
+    empty or vacated day the rider has not marked unavailable, that is no
+    race and that no other move goes to. A move onto a training day is never
     learned: in intervals.icu the two now share a day, and Domestique cannot
-    tell which of them the rider means to ride."""
+    tell which of them the rider means to ride. A move to today is not
+    learned either: re-keying it would delete an event the rider may have
+    ridden already. A session the rider placed (user_moved) is not moved
+    again: if dates were ever read shifted, a learned move would otherwise
+    walk on through the week, run after run."""
     by_day = _sessions_by_day(plan)
     counts = {}
     for ev in existing:
@@ -759,7 +773,7 @@ def _learnable_moves(held: dict, existing: list, plan: dict, today: date,
     out = []
     for eid, (enc, n, ev) in held.items():
         d = _event_day(ev)
-        if counts.get(eid) != 1 or d is None or d < today:
+        if counts.get(eid) != 1 or d is None or d <= today:
             continue
         dst = d.isoformat()
         if enc < today.isoformat() or _iso_week(enc) != _iso_week(dst):
@@ -770,6 +784,7 @@ def _learnable_moves(held: dict, existing: list, plan: dict, today: date,
         src = src_rows[0]
         if (_is_stub(src) or (src.get("session_type") or "") == "rest"
                 or str(src.get("status") or "pending") != "pending"
+                or src.get("user_moved")
                 or src.get("is_race") or _same_workout(src, ev, names) is False):
             continue
         if dst_rows and not ((dst_rows[0].get("session_type") or "") == "rest"
@@ -778,7 +793,10 @@ def _learnable_moves(held: dict, existing: list, plan: dict, today: date,
         if (dst_rows and dst_rows[0].get("is_race")) or _day_unavailable(plan, dst):
             continue
         out.append((eid, enc, dst))
-    return out
+    # Two moves onto one day: the second would land on a training day and
+    # swap -- neither is learned.
+    dsts = [dst for _e, _s, dst in out]
+    return [m for m in out if dsts.count(m[2]) == 1]
 
 
 def _looks_like_a_date_shift(existing: list, profile_id: str, today: date) -> bool:
@@ -797,20 +815,26 @@ def _looks_like_a_date_shift(existing: list, profile_id: str, today: date) -> bo
         parts = eid[len(prefix):].split(":")
         total += 1
         off += parts[0] != d.isoformat()
-    return total >= 3 and off * 2 > total
+    return total > 0 and off * 2 > total
 
 
-def _learn_moves(existing: list, profile_id: str, today: date, names) -> list:
+def _learn_moves(existing: list, profile_id: str, today: date, names,
+                 plan_path: Path) -> list:
     """#33: write the learnable moves into the plan, under the plan lock, on
     a fresh read. Returns [{external_id, from, to, name}] for what moved.
     Lock order is the reconcile lock, then the plan lock; no plan-lock holder
     ever waits for the reconcile lock."""
     import app as _app
     import training_planner as tp
-    path = Path(getattr(tp, "PLAN_DIR", domestique_home() / "plans")) / "current_plan.json"
+    from profile_manager import ProfileManager
     learned = []
     with tp.plan_write_lock():
-        plan = _load_plan()
+        # A profile switch during the run (the GET can take 30 s) must never
+        # write this rider's move into the other rider's plan.
+        if ProfileManager.get().active_id != profile_id:
+            _log.info("EVENT=icu_calendar_learn_skipped reason=profile_switch")
+            return []
+        plan = _load_plan(plan_path)
         if plan is None:
             return []
         held, _agreed = _held_ids(existing, _sessions_by_day(plan), profile_id,
@@ -821,7 +845,7 @@ def _learn_moves(existing: list, profile_id: str, today: date, names) -> list:
                 learned.append({"external_id": eid, "from": enc, "to": dst,
                                 "name": str(moved.get("zwo_name") or moved.get("session_type") or "")})
         if learned:
-            tp.atomic_write_plan(path, plan)
+            tp.atomic_write_plan(plan_path, plan)
     for m in learned:
         _log.info("EVENT=icu_calendar_move_learned from=%s to=%s", m["from"], m["to"])
     return learned
@@ -924,7 +948,8 @@ def _reconcile(horizon_days: int) -> dict:
             return _result(error=err)
         if not write_ok(pm):
             return _result(needs_reconnect=True)
-        plan = _load_plan()
+        plan_path = _plan_path()          # #33: this run's rider, fixed
+        plan = _load_plan(plan_path)
         if plan is None:
             return _result(error="no_plan")
         today = clock.today()
@@ -959,9 +984,10 @@ def _reconcile(horizon_days: int) -> dict:
         result["learned"] = []
         if (held and _learnable_moves(held, existing, plan, today, names)
                 and not _looks_like_a_date_shift(existing, profile_id, today)):
-            result["learned"] = _learn_moves(existing, profile_id, today, names)
+            result["learned"] = _learn_moves(existing, profile_id, today, names,
+                                             plan_path)
             if result["learned"]:
-                plan = _load_plan() or plan
+                plan = _load_plan(plan_path) or plan
                 desired, skipped, broken_ids = _desired_events(
                     pm, plan, today, horizon_days, profile_id)
                 result["skipped"] = skipped
