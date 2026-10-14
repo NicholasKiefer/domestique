@@ -284,7 +284,9 @@ def test_a_failed_push_after_learning_says_the_plan_changed():
 const seen = [];
 global.showToast = (m) => seen.push(m);
 icuPushToastFromResult({error: 'http_500', learned: [{from: 'a', to: 'b'}]}, 'Pushed');
+icuPushToastFromResult({needs_reconnect: true, learned: [{from: 'a', to: 'b'}, {from: 'c', to: 'd'}]}, 'Pushed');
 if (!seen[0].startsWith('Your plan now follows 1 move you made in intervals.icu')) throw new Error(seen[0]);
+if (!seen[1].startsWith('Your plan now follows 2 moves') || !seen[1].includes('reconnect')) throw new Error(seen[1]);
 console.log('OK');
 """
     _run_node(harness)

@@ -16752,6 +16752,14 @@ async function icuPushRefreshButton() {
 }
 
 function icuPushToastFromResult(r, verb) {
+  const nl = (r.learned || []).length;
+  if (nl && (r.needs_reconnect || r.error)) {
+    // #33: the plan already followed the moves; only the calendar update failed.
+    showToast(`Your plan now follows ${nl} move${nl === 1 ? '' : 's'} you made in intervals.icu, but the calendar update failed` +
+      (r.needs_reconnect ? ' — reconnect intervals.icu in Settings → Connections.' : ' — try again in a moment.'), 7000, 'warning');
+    if (typeof loadPlan === 'function') { try { loadPlan(); } catch (_) {} }
+    return;
+  }
   if (r.needs_reconnect) {
     showToast('intervals.icu needs a quick reconnect to allow calendar writes — Settings → Connections.', 7000, 'warning');
     return;
@@ -16766,13 +16774,6 @@ function icuPushToastFromResult(r, verb) {
     return;
   }
   if (r.error) {
-    const nl = (r.learned || []).length;
-    if (nl) {
-      // #33: the plan already followed the moves; only the calendar update failed.
-      showToast(`Your plan now follows ${nl} move${nl === 1 ? '' : 's'} you made in intervals.icu, but the calendar update failed — try again in a moment.`, 7000, 'warning');
-      if (typeof loadPlan === 'function') { try { loadPlan(); } catch (_) {} }
-      return;
-    }
     showToast("Couldn't reach intervals.icu — nothing was changed. Try again in a moment.", 6000, 'error');
     return;
   }
@@ -16785,7 +16786,7 @@ function icuPushToastFromResult(r, verb) {
   if (nSkip) msg += ' · ' + nSkip + ' skipped';
   // #28: workouts the rider moved in intervals.icu are left there on purpose.
   // #33: moves made in intervals.icu that the plan now follows.
-  const nLearned = (r.learned || []).length;
+  const nLearned = nl;
   if (nLearned === 1) msg += ' · 1 workout moved in your plan to match intervals.icu';
   else if (nLearned > 1) msg += ' · ' + nLearned + ' workouts moved in your plan to match intervals.icu';
   if (r.held === 1) msg += ' · 1 workout kept where you moved it in intervals.icu';
