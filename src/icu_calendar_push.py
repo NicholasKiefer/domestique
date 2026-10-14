@@ -626,10 +626,7 @@ def _held_ids(events: list, by_day: dict, profile_id: str,
         # upsert or delete could hit the rider's copy. A move into the past
         # is never agreed nor released either: following it would re-date a
         # past (possibly ride-paired) event — past days are never re-dated.
-        # Nor is a move to today (#33): re-keying deletes the rider's event,
-        # which a ride today may already be paired with. It stays held, and
-        # the session the plan has there now is its stand-in.
-        if len(evs) == 1 and d > today:
+        if len(evs) == 1 and d >= today:
             k = _plan_agrees(by_day, enc, n, d.isoformat(), ev)
             if k is not None:
                 agreed[eid] = f"{prefix}{d.isoformat()}:{k}"
@@ -1031,7 +1028,12 @@ def _reconcile(horizon_days: int) -> dict:
                 "POST", f"athlete/{athlete_id}/events/bulk?upsert=true",
                 payload=desired)
             if 200 <= status < 300:
-                note_pushed(desired)
+                # Only what we put on a day it was not on (new or re-dated):
+                # an unchanged re-push must not hide a move the rider makes
+                # right after it.
+                note_pushed([ev for ev in desired
+                             if str((ours.get(ev["external_id"]) or {}).get("start_date_local") or "")[:10]
+                             != ev["start_date_local"][:10]])
             if _scope_403(status, body):
                 result["needs_reconnect"] = True
                 return result

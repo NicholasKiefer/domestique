@@ -89,33 +89,53 @@ def test_a_drag_onto_a_rest_day_is_learned_and_the_event_rekeyed(env, echo):
     _one_event_per_session(env)
 
 
-def test_a_drag_to_today_is_learned_and_the_riders_event_kept(env):
-    """Owner (#33): the plan follows a move to today, but the event the
-    rider may already have ridden (intervals.icu pairs the ride with it) is
-    never deleted or re-keyed; the session on today stands in for it."""
+def test_a_drag_to_today_is_learned_like_any_move(env):
+    """Owner (#33): the plan follows a move to today. The event is re-keyed
+    like any learned move (keeping the old id blocked the vacated day for
+    every later workout, grill r4 M3)."""
     _seed(env, _week(mon="sweet.zwo", thu="steady.zwo", sat="vo2.zwo"))
-    env.fk.drag(_eid(env, D["mon"]), D["tue"])           # Monday's goes to Tue
-    _later()
+    env.fk.drag(_eid(env, D["mon"]), D["tue"])            # Monday's goes to Tue
     icp.reconcile()
     _later()
-    thu0 = _eid(env, D["thu"])
-    env.fk.drag(thu0, D["mon"])                           # "ride Thursday's today"
-    paired = env.fk._one(thu0)["id"]
-    mark = len(env.fk.calls)
+    env.fk.drag(_eid(env, D["thu"]), D["mon"])            # "ride Thursday's today"
     r = icp.reconcile()
     assert [(m["from"], m["to"]) for m in r["learned"]] == [(D["thu"], D["mon"])]
     mon, = _on(D["mon"])
     assert (mon["zwo_file"], mon["user_moved"], mon["moved_from"]) == ("steady.zwo", True, D["thu"])
-    assert paired in {e.get("id") for e in env.fk.events}  # never deleted
-    assert env.fk.where(thu0) == [D["mon"]]
-    posted = {ev["external_id"] for m, _p, pl in env.fk.calls[mark:] if m == "POST" for ev in pl}
-    assert _eid(env, D["mon"]) not in posted               # no second copy for today
+    assert env.fk.where(_eid(env, D["mon"])) == [D["mon"]] and env.fk.where(_eid(env, D["thu"])) == []
     assert r["held"] == 0
     _one_event_per_session(env)
-    assert icp.reconcile()["learned"] == []                # settled
+    assert icp.reconcile()["learned"] == []
+
+
+def test_a_workout_put_on_the_day_a_move_left_reaches_the_watch(env):
+    """Grill r4 M3: after a learned move, the day it left takes a new
+    workout like any other day."""
+    ss = _week(mon="sweet.zwo", thu="steady.zwo", sat="vo2.zwo")
+    _seed(env, ss)
+    env.fk.drag(_eid(env, D["thu"]), D["mon"])
+    icp.reconcile()
+    _later()
+    plan = _plan()
+    thu = next(x for w in plan["weeks"] for x in w["sessions"] if x["day"] == D["thu"])
+    thu.update(session_type="z2", zwo_file="tempo_alt.zwo", status="pending",
+               duration_min=60, tss_estimate=45)
+    tp.atomic_write_plan(Path(tp.PLAN_DIR) / "current_plan.json", plan)
+    icp.reconcile()
+    assert env.fk.files_on().get(D["thu"]) == ["tempo_alt"]
     sent = env.client.post("/api/calendar/push-workout", json={
-        "source": "planner", "zwo_file": "steady.zwo", "date": D["mon"]}).json()
-    assert sent == {"ok": True, "pushed": 0, "kept_on": D["mon"]}
+        "source": "planner", "zwo_file": "tempo_alt.zwo", "date": D["thu"]}).json()
+    assert sent.get("pushed") == 1, sent
+
+
+def test_a_move_right_after_an_unchanged_push_is_learned(env):
+    """Grill r4 M1: every reconcile re-pushes; only events we put on a new
+    day count as "just written"."""
+    _seed(env, _week(mon="sweet.zwo", tue="vo2.zwo", wed="steady.zwo"))
+    icp.reconcile()                                       # an unchanged re-push
+    env.fk.drag(_eid(env, D["wed"]), D["fri"])            # the rider, right after
+    r = icp.reconcile()
+    assert [(m["from"], m["to"]) for m in r["learned"]] == [(D["wed"], D["fri"])]
 
 
 @pytest.mark.parametrize("why,setup", [
