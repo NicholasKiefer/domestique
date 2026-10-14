@@ -51,6 +51,21 @@ def _seed(env, ss):
     _write_plan(ss)
     r = icp.reconcile()
     assert not r.get("error") and r["learned"] == [] and r["held"] == 0, r
+    _later()
+
+
+def _later():
+    """The rider drags minutes after our push, not in the same instant: the
+    recent-push guard (an event we just wrote read back elsewhere is a
+    reading problem) must not see the drag as one."""
+    icp._RECENT_PUSH.clear()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_push_memory():
+    icp._RECENT_PUSH.clear()
+    yield
+    icp._RECENT_PUSH.clear()
 
 
 @pytest.mark.parametrize("echo", [True, False])
@@ -74,17 +89,33 @@ def test_a_drag_onto_a_rest_day_is_learned_and_the_event_rekeyed(env, echo):
     _one_event_per_session(env)
 
 
-def test_a_drag_to_today_is_held_and_keeps_the_riders_event(env):
-    """Grill r2 M-B: re-keying a move to today deleted the event the rider
-    may already have ridden (intervals.icu pairs the ride with it)."""
-    _seed(env, _week(thu="steady.zwo"))
+def test_a_drag_to_today_is_learned_and_the_riders_event_kept(env):
+    """Owner (#33): the plan follows a move to today, but the event the
+    rider may already have ridden (intervals.icu pairs the ride with it) is
+    never deleted or re-keyed; the session on today stands in for it."""
+    _seed(env, _week(mon="sweet.zwo", thu="steady.zwo", sat="vo2.zwo"))
+    env.fk.drag(_eid(env, D["mon"]), D["tue"])           # Monday's goes to Tue
+    _later()
+    icp.reconcile()
+    _later()
     thu0 = _eid(env, D["thu"])
-    env.fk.drag(thu0, D["mon"])                           # MON is today
+    env.fk.drag(thu0, D["mon"])                           # "ride Thursday's today"
     paired = env.fk._one(thu0)["id"]
-    before = _plan()
+    mark = len(env.fk.calls)
     r = icp.reconcile()
-    assert r["learned"] == [] and r["held"] == 1 and _plan() == before
-    assert paired in {e.get("id") for e in env.fk.events}
+    assert [(m["from"], m["to"]) for m in r["learned"]] == [(D["thu"], D["mon"])]
+    mon, = _on(D["mon"])
+    assert (mon["zwo_file"], mon["user_moved"], mon["moved_from"]) == ("steady.zwo", True, D["thu"])
+    assert paired in {e.get("id") for e in env.fk.events}  # never deleted
+    assert env.fk.where(thu0) == [D["mon"]]
+    posted = {ev["external_id"] for m, _p, pl in env.fk.calls[mark:] if m == "POST" for ev in pl}
+    assert _eid(env, D["mon"]) not in posted               # no second copy for today
+    assert r["held"] == 0
+    _one_event_per_session(env)
+    assert icp.reconcile()["learned"] == []                # settled
+    sent = env.client.post("/api/calendar/push-workout", json={
+        "source": "planner", "zwo_file": "steady.zwo", "date": D["mon"]}).json()
+    assert sent == {"ok": True, "pushed": 0, "kept_on": D["mon"]}
 
 
 @pytest.mark.parametrize("why,setup", [
@@ -242,13 +273,13 @@ class _ShiftedFakeICU(WindowedFakeICU):
         return status, body
 
 
-def test_one_moved_event_of_one_is_not_learned(env):
-    """With a single event of ours a date shift and a move look the same:
-    nothing is learned, the move is held."""
+def test_the_only_event_of_ours_is_learned_too(env):
+    """The date-shift guard needs two events to judge; a single event is
+    protected by the midnight and recent-push checks instead."""
     _seed(env, _week(wed="steady.zwo"))
     env.fk.drag(_eid(env, D["wed"]), D["fri"])
     r = icp.reconcile()
-    assert r["learned"] == [] and r["held"] == 1
+    assert [(m["from"], m["to"]) for m in r["learned"]] == [(D["wed"], D["fri"])]
 
 
 def test_a_date_read_back_shifted_never_walks_a_workout(env, monkeypatch):
@@ -264,16 +295,39 @@ def test_a_date_read_back_shifted_never_walks_a_workout(env, monkeypatch):
     assert days == [D["tue"]] * 4
 
 
-def test_a_session_the_rider_placed_is_not_moved_again(env):
-    """A learned (or dragged) session is user_moved; a later intervals.icu
-    move of it stays held instead of being learned again."""
+def test_a_second_move_is_learned_too(env):
+    """Owner (#33): a workout already moved once follows a second move."""
     _seed(env, _week(mon="sweet.zwo", tue="vo2.zwo", wed="steady.zwo"))
     env.fk.drag(_eid(env, D["wed"]), D["fri"])
     assert len(icp.reconcile()["learned"]) == 1
+    _later()
     env.fk.drag(_eid(env, D["fri"]), D["sat"])
+    r = icp.reconcile()
+    assert [(m["from"], m["to"]) for m in r["learned"]] == [(D["fri"], D["sat"])]
+    sat, = _on(D["sat"])
+    assert sat["zwo_file"] == "steady.zwo" and sat["user_moved"] is True
+    assert env.fk.files_on()[D["sat"]] == ["steady"]
+    _one_event_per_session(env)
+
+
+def test_our_own_push_read_back_elsewhere_is_not_a_move(env):
+    """An event we wrote minutes ago that reads back on another day is a
+    date-reading problem: learning it would walk the workout on."""
+    _seed(env, _week(mon="sweet.zwo", tue="vo2.zwo", wed="steady.zwo"))
+    icp.note_pushed([{"external_id": _eid(env, D["wed"]), "start_date_local": f"{D['wed']}T00:00:00"}])
+    env.fk.drag(_eid(env, D["wed"]), D["fri"])
     before = _plan()
     r = icp.reconcile()
     assert r["learned"] == [] and _plan() == before and r["held"] == 1
+
+
+def test_a_changed_time_of_day_is_not_a_move(env):
+    """A timezone shift moves the hour; a drag keeps our midnight."""
+    _seed(env, _week(mon="sweet.zwo", tue="vo2.zwo", wed="steady.zwo"))
+    env.fk._one(_eid(env, D["wed"]))["start_date_local"] = f"{D['thu']}T01:00:00"
+    before = _plan()
+    r = icp.reconcile()
+    assert r["learned"] == [] and _plan() == before
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")

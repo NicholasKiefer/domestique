@@ -8115,6 +8115,7 @@ def api_calendar_push_workout(body: "dict | None" = None):
                 return {"error": "network"}
             if not (200 <= status < 300):
                 return {"error": f"http_{status}"}
+            _icp.note_pushed(events)
             _log.info("EVENT=icu_calendar_push_workout source=%s date=%s pushed=1",
                       source, date_iso)
             return {"ok": True, "pushed": 1, "event_date": date_iso}

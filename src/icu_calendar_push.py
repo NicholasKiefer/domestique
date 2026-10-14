@@ -69,6 +69,7 @@ import json
 import logging
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 import tls_trust  # v3.11.4 — one verifier for every intervals.icu connection
@@ -625,7 +626,10 @@ def _held_ids(events: list, by_day: dict, profile_id: str,
         # upsert or delete could hit the rider's copy. A move into the past
         # is never agreed nor released either: following it would re-date a
         # past (possibly ride-paired) event — past days are never re-dated.
-        if len(evs) == 1 and d >= today:
+        # Nor is a move to today (#33): re-keying deletes the rider's event,
+        # which a ride today may already be paired with. It stays held, and
+        # the session the plan has there now is its stand-in.
+        if len(evs) == 1 and d > today:
             k = _plan_agrees(by_day, enc, n, d.isoformat(), ev)
             if k is not None:
                 agreed[eid] = f"{prefix}{d.isoformat()}:{k}"
@@ -753,17 +757,18 @@ def _learnable_moves(held: dict, existing: list, plan: dict, today: date,
     them in Domestique: [(external_id, from_day, to_day)].
 
     Only the plain case, everything else stays held (#28 step 1): one event
-    under the id (never a copy), from today or later to a day after today in
-    the same week, the day it left holds exactly that one pending workout
-    the rider has not placed already, and the day it went to is a rest,
-    empty or vacated day the rider has not marked unavailable, that is no
-    race and that no other move goes to. A move onto a training day is never
-    learned: in intervals.icu the two now share a day, and Domestique cannot
-    tell which of them the rider means to ride. A move to today is not
-    learned either: re-keying it would delete an event the rider may have
-    ridden already. A session the rider placed (user_moved) is not moved
-    again: if dates were ever read shifted, a learned move would otherwise
-    walk on through the week, run after run."""
+    under the id (never a copy), both days today or later and in the same
+    week, the day it left holds exactly that one pending workout, and the
+    day it went to is a rest, empty or vacated day the rider has not marked
+    unavailable, that is no race and that no other move goes to. A move onto
+    a training day is never learned: in intervals.icu the two now share a
+    day, and Domestique cannot tell which of them the rider means to ride.
+
+    Dates read back wrong must never look like moves (a learned move would
+    otherwise walk on, run after run): the event keeps the midnight we wrote
+    (a timezone shift changes the hour, a drag does not), and an event we
+    pushed in the last few minutes that reads back elsewhere is a reading
+    problem, not the rider."""
     by_day = _sessions_by_day(plan)
     counts = {}
     for ev in existing:
@@ -773,7 +778,12 @@ def _learnable_moves(held: dict, existing: list, plan: dict, today: date,
     out = []
     for eid, (enc, n, ev) in held.items():
         d = _event_day(ev)
-        if counts.get(eid) != 1 or d is None or d <= today:
+        if counts.get(eid) != 1 or d is None or d < today:
+            continue
+        if str(ev.get("start_date_local") or "")[10:] not in ("", "T00:00:00"):
+            continue
+        pushed = _RECENT_PUSH.get(eid)
+        if pushed and pushed[0] != d.isoformat() and time.monotonic() - pushed[1] < _RECENT_PUSH_S:
             continue
         dst = d.isoformat()
         if enc < today.isoformat() or _iso_week(enc) != _iso_week(dst):
@@ -784,7 +794,6 @@ def _learnable_moves(held: dict, existing: list, plan: dict, today: date,
         src = src_rows[0]
         if (_is_stub(src) or (src.get("session_type") or "") == "rest"
                 or str(src.get("status") or "pending") != "pending"
-                or src.get("user_moved")
                 or src.get("is_race") or _same_workout(src, ev, names) is False):
             continue
         if dst_rows and not ((dst_rows[0].get("session_type") or "") == "rest"
@@ -798,6 +807,20 @@ def _learnable_moves(held: dict, existing: list, plan: dict, today: date,
     dsts = [dst for _e, _s, dst in out]
     return [m for m in out if dsts.count(m[2]) == 1]
 
+
+# #33: the day each event was last pushed on, and when (this process only).
+# An event read back on another day minutes after we wrote it was not moved
+# by the rider: the dates are being read wrong.
+_RECENT_PUSH: dict = {}
+_RECENT_PUSH_S = 600.0
+
+
+def note_pushed(events: list) -> None:
+    now = time.monotonic()
+    for ev in events or []:
+        eid = str(ev.get("external_id") or "")
+        if eid:
+            _RECENT_PUSH[eid] = (str(ev.get("start_date_local") or "")[:10], now)
 
 def _looks_like_a_date_shift(existing: list, profile_id: str, today: date) -> bool:
     """#33 guard: when most of our events from today on sit off their own
@@ -815,7 +838,7 @@ def _looks_like_a_date_shift(existing: list, profile_id: str, today: date) -> bo
         parts = eid[len(prefix):].split(":")
         total += 1
         off += parts[0] != d.isoformat()
-    return total > 0 and off * 2 > total
+    return total >= 2 and off * 2 > total
 
 
 def _learn_moves(existing: list, profile_id: str, today: date, names,
@@ -994,8 +1017,9 @@ def _reconcile(horizon_days: int) -> dict:
                 by_day = _sessions_by_day(plan)
                 held, agreed = _held_ids(existing, by_day, profile_id, today, names)
         # W6: a move into the past is still held, but no longer news.
-        result["held"] = sum(1 for _e, _n, ev in held.values()
-                             if _event_day(ev) >= today)
+        learned_ids = {m["external_id"] for m in result["learned"]}
+        result["held"] = sum(1 for eid, (_e, _n, ev) in held.items()
+                             if _event_day(ev) >= today and eid not in learned_ids)
         if held:
             stand_ins = _stand_ins(held, by_day, profile_id, names)
             desired = [ev for ev in desired
@@ -1006,6 +1030,8 @@ def _reconcile(horizon_days: int) -> dict:
             status, body = _http(
                 "POST", f"athlete/{athlete_id}/events/bulk?upsert=true",
                 payload=desired)
+            if 200 <= status < 300:
+                note_pushed(desired)
             if _scope_403(status, body):
                 result["needs_reconnect"] = True
                 return result
