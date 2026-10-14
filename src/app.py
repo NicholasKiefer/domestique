@@ -1808,9 +1808,10 @@ def api_profile_ftp_history():
         # Derive the canonical "type" from source if populated (catches
         # eftp_auto / eftp_icu / tested_* enums), else fall back to method.
         if src in ("eftp_auto", "eftp_icu", "eftp_local",
-                   "tested_coggan_20min", "tested_ramp"):
+                   "tested_coggan_20min", "tested_ramp", "tested_sixty_min",
+                   "tested_cp_test"):
             row_type = src
-        elif method in ("coggan_20min", "ramp"):
+        elif method in ("coggan_20min", "ramp", "sixty_min", "cp_test"):
             row_type = f"tested_{method}"
         else:
             row_type = "manual"
@@ -1850,6 +1851,8 @@ def api_profile_update_ftp(body: dict):
     source_map = {
         "coggan_20min": "tested_coggan_20min",
         "ramp": "tested_ramp",
+        "sixty_min": "tested_sixty_min",
+        "cp_test": "tested_cp_test",
         "manual": "manual",
     }
     ftp_source_tag = source_map.get(method, "manual")
@@ -3869,7 +3872,7 @@ async def api_readiness_revert_cap(request: Request):
     try:
         json_path = _plan_dir() / "current_plan.json"
         if json_path.exists():
-            with tp.plan_write_lock():
+            async with tp.plan_write_lock_async():
                 with open(json_path, encoding="utf-8") as f:
                     plan = json.load(f)
                 today_iso = clock.today().isoformat()
@@ -3944,7 +3947,7 @@ async def api_readiness_apply_tier_down(request: Request):
     if not json_path.exists():
         return JSONResponse({"error": "No active plan found"}, 404)
     try:
-        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+        async with tp.plan_write_lock_async():  # #32: read-modify-write under the plan lock
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
             target = None
@@ -4179,7 +4182,7 @@ async def api_plan_auto_adjust(request: Request):
     json_path = _plan_dir() / "current_plan.json"
     if not json_path.exists():
         return JSONResponse({"error": "No active plan found"}, 404)
-    with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+    async with tp.plan_write_lock_async():  # #32: read-modify-write under the plan lock
         try:
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
@@ -7781,13 +7784,17 @@ def _icu_push_note_result(res: dict) -> None:
     global _icu_push_last_result
     try:
         # #34: remember whose calendar it was, so a profile switch does not
-        # show the previous rider's result in Settings.
-        try:
-            from profile_manager import ProfileManager
-            _pid = ProfileManager.get().active_id
-        except Exception:
-            _pid = None
-        _icu_push_last_result = {"at": clock.now().isoformat(), "profile_id": _pid, **res}
+        # show the previous rider's result in Settings. The reconcile names
+        # the profile it ran for; a switch during a slow run must not
+        # relabel it (3.13.0 review).
+        _pid = res.get("profile_id")
+        if _pid is None:
+            try:
+                from profile_manager import ProfileManager
+                _pid = ProfileManager.get().active_id
+            except Exception:
+                _pid = None
+        _icu_push_last_result = {"at": clock.now().isoformat(), **res, "profile_id": _pid}
     except Exception:
         pass
 
@@ -7817,7 +7824,7 @@ def _icu_push_sync_enabled() -> bool:
         return False
 
 
-def _icu_push_debounced_run(expected_pid: str, retried: bool = False) -> None:
+def _icu_push_debounced_run(expected_pid: str, retried: int = 0) -> None:
     global _icu_push_timer
     with _icu_push_timer_lock:
         _icu_push_timer = None
@@ -7837,6 +7844,8 @@ def _icu_push_debounced_run(expected_pid: str, retried: bool = False) -> None:
             return
         import icu_calendar_push
         res = icu_calendar_push.reconcile()
+        if res.get("error") == "swept":         # sync went off while it waited
+            return
         _icu_push_note_result(res)
         # 3.3.1 hotfix (B3b): this line omitted `error` entirely — the
         # tester's swap-triggered 422 failed with a clean-looking log line.
@@ -7848,12 +7857,13 @@ def _icu_push_debounced_run(expected_pid: str, retried: bool = False) -> None:
         # #28 W16: "busy" = another reconcile held the calendar lock past
         # the wait, so the plan write this run was armed for never reached
         # intervals.icu, and the next trigger can be tomorrow's daily run.
-        # Re-arm once; a timer a newer plan write armed meanwhile covers it.
-        if res.get("error") == "busy" and not retried:
+        # Re-arm (up to 10 times, ~15 min); a timer a newer plan write armed
+        # meanwhile covers it.
+        if res.get("error") == "busy" and retried < 10:
             with _icu_push_timer_lock:
                 if _icu_push_timer is None:
                     t = threading.Timer(ICU_PUSH_DEBOUNCE_S, _icu_push_debounced_run,
-                                        args=(expected_pid, True))
+                                        args=(expected_pid, retried + 1))
                     t.daemon = True
                     _icu_push_timer = t
                     t.start()
@@ -7933,6 +7943,9 @@ def _icu_push_daily_from_sync() -> None:
         _icu_push_last_daily = today
         import icu_calendar_push
         res = icu_calendar_push.reconcile()
+        if res.get("error") == "swept":         # sync went off while it waited
+            _icu_push_last_daily = None         # the day's run did not happen
+            return
         _icu_push_note_result(res)
         if res.get("error"):
             _icu_push_last_daily = None   # transient — retry next sync pass
@@ -8005,7 +8018,7 @@ def api_icu_push(body: "dict | None" = None):
             _icu_push_cancel_pending()      # a pending debounce would re-push
             res = _icp.sweep_all()          # G-A: final forward sweep
             return {"ok": True, "sync_enabled": False, **res}
-        res = _icp.reconcile()
+        res = _icp.reconcile(abort_if_swept=False)
         _icu_push_note_result(res)          # 3.3.1 hotfix (B3b): status parity
         return {"ok": not res.get("error") and not res.get("needs_reconnect"),
                 **res}
@@ -8102,6 +8115,7 @@ def api_calendar_push_workout(body: "dict | None" = None):
                 return {"error": "network"}
             if not (200 <= status < 300):
                 return {"error": f"http_{status}"}
+            _icp.note_pushed(events)
             _log.info("EVENT=icu_calendar_push_workout source=%s date=%s pushed=1",
                       source, date_iso)
             return {"ok": True, "pushed": 1, "event_date": date_iso}
@@ -8134,7 +8148,12 @@ def api_calendar_push_workout(body: "dict | None" = None):
 
         def _push_planned():
             # #28: read the plan, the window and push under the reconcile
-            # lock, so a reconcile this waited for is seen whole.
+            # lock, so a reconcile this waited for is seen whole. The wait can
+            # outlast a profile switch or midnight (3.13.0 review).
+            if ProfileManager.get().active_id != profile_id:
+                return {"error": "profile_changed"}
+            if target < clock.today():
+                return {"error": "date_out_of_range"}
             plan = _icp._load_plan()
             if plan is None:
                 return {"error": "no_plan"}
@@ -8181,6 +8200,68 @@ def api_calendar_push_workout(body: "dict | None" = None):
         return _icp._one_at_a_time(_icp._RECONCILE_LOCK_TIMEOUT_S, _push_planned)
     except Exception as e:                      # amendment 7: zero 500s, ever
         _log.exception("calendar push-workout endpoint failed")
+        return {"error": f"internal:{type(e).__name__}"}
+
+
+_ICU_RACE_PRIORITY = {"RACE_A": "A", "RACE_B": "B", "RACE_C": "C"}
+
+
+@app.get("/api/icu/races")
+def api_icu_races():
+    """Race import (3.13.0): the rider's races planned in intervals.icu
+    (RACE_A / RACE_B / RACE_C events, today .. +365 days) for the plan builder
+    to show. Read-only: the rider maps each race in the builder and Generate
+    saves the plan as usual; nothing is stored here.
+
+    Always 200: {races: [{date, name, priority, sport, distance_km}]} sorted by
+    date, or {needs_reconnect} / {error}. Reading events needs the calendar
+    scope the push already asks for (CALENDAR:WRITE covers READ)."""
+    import icu_calendar_push as _icp
+    from profile_manager import ProfileManager
+    try:
+        pm = ProfileManager.get()
+        if not pm.active_id:
+            return {"error": "no_active_profile"}
+        athlete_id, err = _icp._connection(pm)
+        if err:
+            return {"error": err}
+        if not _icp.write_ok(pm):
+            return {"needs_reconnect": True}
+        today = clock.today()
+        status, body = _icp._http(
+            "GET", f"athlete/{athlete_id}/events?oldest={today.isoformat()}"
+                   f"&newest={(today + timedelta(days=365)).isoformat()}")
+        if _icp._scope_403(status, body) or status == 401:   # 401: token revoked/expired
+            return {"needs_reconnect": True}
+        if status == 0:
+            return {"error": "network"}
+        if not (200 <= status < 300):
+            return {"error": f"http_{status}"}
+        try:
+            rows = json.loads(body or b"[]")
+        except (json.JSONDecodeError, ValueError):
+            return {"error": "bad_response"}
+        races = []
+        for ev in rows if isinstance(rows, list) else []:
+            if not isinstance(ev, dict):
+                continue
+            prio = _ICU_RACE_PRIORITY.get(str(ev.get("category") or ""))
+            day = _icp._event_day(ev)
+            if prio is None or day is None or day < today:
+                continue
+            dist = ev.get("distance")
+            km = (round(float(dist) / 1000.0, 1)
+                  if isinstance(dist, (int, float)) and not isinstance(dist, bool)
+                  and 0 < dist < 2_000_000 else None)
+            races.append({"date": day.isoformat(),
+                          "name": str(ev.get("name") or "").strip()[:120],
+                          "priority": prio,
+                          "sport": str(ev.get("type") or ""),
+                          "distance_km": km})
+        races.sort(key=lambda r: (r["date"], r["priority"], r["name"]))
+        return {"races": races}
+    except Exception as e:                      # always 200, never a 500
+        _log.exception("icu races read failed")
         return {"error": f"internal:{type(e).__name__}"}
 
 
@@ -9538,7 +9619,7 @@ async def api_today_session_persist(request: Request):
             return JSONResponse({"error": "session_type required"}, 400)
 
         today_iso = clock.today().isoformat()
-        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+        async with tp.plan_write_lock_async():  # #32: read-modify-write under the plan lock
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
 
@@ -10110,7 +10191,7 @@ async def api_continuous_deload_revert(request: Request):
     if not json_path.exists():
         return JSONResponse({"reverted": False, "reason": "no_plan"}, 404)
     try:
-        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+        async with tp.plan_write_lock_async():  # #32: read-modify-write under the plan lock
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
             rec = plan.get("deload_advance") or {}
@@ -11355,7 +11436,7 @@ async def api_plan_generate(request: Request):
         availability_overrides: dict[str, float] = {}
         old_availability_full: dict = {}  # v1.8.21 — keep type info for block-preserve
         _existing_plan = None
-        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+        async with tp.plan_write_lock_async():  # #32: read-modify-write under the plan lock
             if json_path.exists():
                 try:
                     with open(json_path, encoding="utf-8") as f:
@@ -11670,7 +11751,7 @@ async def api_plan_reforecast():
         return JSONResponse({"error": "No active plan found"}, 404)
 
     try:
-        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+        async with tp.plan_write_lock_async():  # #32: read-modify-write under the plan lock
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
 
@@ -11812,7 +11893,7 @@ async def api_mark_unavailable(request: Request):
         return JSONResponse({"error": "No active plan found"}, 404)
 
     try:
-        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+        async with tp.plan_write_lock_async():  # #32: read-modify-write under the plan lock
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
 
@@ -11862,7 +11943,7 @@ async def api_save_availability(request: Request):
         return JSONResponse({"error": "No active plan found"}, 404)
 
     try:
-        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+        async with tp.plan_write_lock_async():  # #32: read-modify-write under the plan lock
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
 
@@ -12565,7 +12646,7 @@ async def api_plan_regenerate_dynamic(request: Request):
 
     try:
 
-        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+        async with tp.plan_write_lock_async():  # #32: read-modify-write under the plan lock
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
 
@@ -12636,7 +12717,7 @@ async def api_plan_add_race(request: Request):
         "event_type": str((body or {}).get("type") or (body or {}).get("event_type") or "crit"),
     }
     try:
-        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+        async with tp.plan_write_lock_async():  # #32: read-modify-write under the plan lock
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
             goal = plan.setdefault("goal", {})
@@ -12684,7 +12765,7 @@ async def api_plan_update(debounce: int = Query(0)):
     if not json_path.exists():
         return JSONResponse({"error": "No active plan found"}, 404)
     try:
-        with tp.plan_write_lock():
+        async with tp.plan_write_lock_async():
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
             training = cached("training", get_today_metrics)
@@ -14143,6 +14224,18 @@ async def api_plan_move_session(request: Request):
                    for s in src_rows + dst_rows):
                 return JSONResponse(
                     {"error": "That day has already been ridden."}, 409
+                )
+            # A swap puts the session that was there on the day the dragged
+            # one left. From a day that has passed, that would mark a workout
+            # the rider never touched as missed (3.13.0 review).
+            if src_d < clock.today() and any(
+                    (s.get("session_type") or "") != "rest"
+                    and not str(s.get("status") or "").startswith("moved_from:")
+                    for s in dst_rows):
+                return JSONResponse(
+                    {"error": "The workout on that day would move to a day that "
+                              "has passed. Drop this one on a rest day instead."},
+                    409,
                 )
 
             # Mutation is shared with the auto-reschedule path (_apply_move_session):
@@ -15968,7 +16061,7 @@ async def api_plan_rematch(request: Request, apply: int = Query(0)):
         if apply:
             # Read, undo, rematch and write under the plan-write lock the
             # ride-sync adaptation holds: both now rewrite days.
-            with tp.plan_write_lock():
+            async with tp.plan_write_lock_async():
                 with open(json_path, encoding="utf-8") as f:
                     plan = json.load(f)
                 today = clock.today()
@@ -16066,7 +16159,7 @@ async def api_plan_re_draw(request: Request):
     if not json_path.exists():
         return JSONResponse({"error": "No active plan found"}, 404)
     try:
-        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+        async with tp.plan_write_lock_async():  # #32: read-modify-write under the plan lock
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
             try:
@@ -16396,7 +16489,7 @@ async def api_plan_accept_redraw(request: Request):
     if not json_path.exists():
         return JSONResponse({"error": "No active plan found"}, 404)
     try:
-        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+        async with tp.plan_write_lock_async():  # #32: read-modify-write under the plan lock
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
             result = _accept_redraw_apply(plan, day_iso, body)
@@ -16600,7 +16693,7 @@ async def api_plan_swap_type(request: Request):
     if not json_path.exists():
         return JSONResponse({"error": "No active plan found"}, 404)
     try:
-        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+        async with tp.plan_write_lock_async():  # #32: read-modify-write under the plan lock
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
             _micro = (bool(micro_raw) if micro_raw is not None
@@ -16626,6 +16719,8 @@ def _ftp_test_family(fname: str) -> "str | None":
         return "coggan_20min"
     if f.startswith("ftp_test_60min"):
         return "sixty_min"
+    if f.startswith("ftp_test_cp"):
+        return "cp_test"
     return None
 
 
@@ -16643,6 +16738,7 @@ _FTP_TEST_PREFERRED_FILE = {
     "ramp": ("ftp_test_ramp_ladder21_200pct_35min.zwo", 35, 60),
     "coggan_20min": ("ftp_test_coggan_3x1min-1min_95pct_59min.zwo", 59, 75),
     "sixty_min": ("ftp_test_60min_steady_86min.zwo", 86, 100),
+    "cp_test": ("ftp_test_cp_12-7-3min_100pct_110min.zwo", 110, 85),
 }
 
 
@@ -16654,9 +16750,9 @@ async def api_plan_ftp_test_type(request: Request):
     body = await _get_json_body(request)
     day_iso = str(body.get("date") or "").strip()
     test_type = str(body.get("test_type") or "").strip()
-    if test_type not in ("ramp", "coggan_20min", "sixty_min"):
+    if test_type not in _FTP_TEST_PREFERRED_FILE:
         return JSONResponse(
-            {"error": "test_type must be ramp, coggan_20min or sixty_min"}, 400)
+            {"error": "test_type must be ramp, coggan_20min, sixty_min or cp_test"}, 400)
     try:
         date.fromisoformat(day_iso)
     except ValueError:
@@ -16665,7 +16761,7 @@ async def api_plan_ftp_test_type(request: Request):
     if not json_path.exists():
         return JSONResponse({"error": "No active plan found"}, 404)
     try:
-        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+        async with tp.plan_write_lock_async():  # #32: read-modify-write under the plan lock
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
             target = next((s for w in plan.get("weeks", [])
@@ -16737,7 +16833,7 @@ async def api_plan_dismiss_session(request: Request):
         return JSONResponse({"error": "Invalid date format"}, 400)
 
     try:
-        with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
+        async with tp.plan_write_lock_async():  # #32: read-modify-write under the plan lock
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
 
@@ -16784,49 +16880,58 @@ def api_plan_auto_recalc():
         return {"action": "no_plan"}
 
     try:
+        with open(json_path, encoding="utf-8") as f:
+            plan = json.load(f)
+
+        # Check if recalc needed (>7 days since last)
+        last_recalc = plan.get("recalc_date") or plan.get("generated", "")
+        if last_recalc:
+            try:
+                last_dt = datetime.fromisoformat(last_recalc)
+                # Normalize so naive/aware mismatch can't raise TypeError.
+                # Saved plans may include a tz offset (saved_at uses
+                # `.astimezone().isoformat()` elsewhere); strip it so the
+                # subtraction with `clock.now()` is always homogeneous.
+                if last_dt.tzinfo is not None:
+                    last_dt = last_dt.replace(tzinfo=None)
+                days_since = (clock.now() - last_dt).days
+                if days_since < 7:
+                    # Still fresh — return event readiness only.
+                    # 3.3.2 (Lapo #2): readiness is DECORATIVE on this branch —
+                    # its own try, so a readiness/metrics exception can never
+                    # convert a FRESH verdict into a full plan rebuild (the old
+                    # shared except turned any ValueError/TypeError here into a
+                    # silent every-visit recalc).
+                    readiness = {}
+                    try:
+                        training = cached("training", get_today_metrics)
+                        current_ctl = _planning_ctl()
+                        g = plan.get("goal", {})
+                        goal = tp.goal_from_dict(g)
+                        if goal.target_date:           # one that parses
+                            if goal.longest_ride_h_90d is None:
+                                goal.longest_ride_h_90d = _longest_ride_h_90d()
+                            readiness = tp.compute_event_readiness(goal, current_ctl)
+                    except Exception:  # noqa: BLE001 — decorative readiness only
+                        _log.exception("auto-recalc: fresh-branch readiness failed (returning fresh)")
+                        readiness = {}
+                    return {"action": "fresh", "days_since_recalc": days_since, "event_readiness": readiness}
+            except (ValueError, TypeError):
+                pass
+
+        # Recalc needed. The intervals.icu reads come first, off the plan
+        # lock: with retries they can take minutes, and every plan writer
+        # would wait behind them (3.13.0 review).
+        training = cached("training", get_today_metrics)
+        current_ctl = _planning_ctl()
+        wellness = cached("wellness_7", lambda: fetch_wellness(7))
+        seen_recalc = plan.get("recalc_date") or plan.get("generated", "")
         with tp.plan_write_lock():  # #32: read-modify-write under the plan lock
             with open(json_path, encoding="utf-8") as f:
                 plan = json.load(f)
-
-            # Check if recalc needed (>7 days since last)
-            last_recalc = plan.get("recalc_date") or plan.get("generated", "")
-            if last_recalc:
-                try:
-                    last_dt = datetime.fromisoformat(last_recalc)
-                    # Normalize so naive/aware mismatch can't raise TypeError.
-                    # Saved plans may include a tz offset (saved_at uses
-                    # `.astimezone().isoformat()` elsewhere); strip it so the
-                    # subtraction with `clock.now()` is always homogeneous.
-                    if last_dt.tzinfo is not None:
-                        last_dt = last_dt.replace(tzinfo=None)
-                    days_since = (clock.now() - last_dt).days
-                    if days_since < 7:
-                        # Still fresh — return event readiness only.
-                        # 3.3.2 (Lapo #2): readiness is DECORATIVE on this branch —
-                        # its own try, so a readiness/metrics exception can never
-                        # convert a FRESH verdict into a full plan rebuild (the old
-                        # shared except turned any ValueError/TypeError here into a
-                        # silent every-visit recalc).
-                        readiness = {}
-                        try:
-                            training = cached("training", get_today_metrics)
-                            current_ctl = _planning_ctl()
-                            g = plan.get("goal", {})
-                            goal = tp.goal_from_dict(g)
-                            if goal.target_date:           # one that parses
-                                if goal.longest_ride_h_90d is None:
-                                    goal.longest_ride_h_90d = _longest_ride_h_90d()
-                                readiness = tp.compute_event_readiness(goal, current_ctl)
-                        except Exception:  # noqa: BLE001 — decorative readiness only
-                            _log.exception("auto-recalc: fresh-branch readiness failed (returning fresh)")
-                            readiness = {}
-                        return {"action": "fresh", "days_since_recalc": days_since, "event_readiness": readiness}
-                except (ValueError, TypeError):
-                    pass
-
-            # Recalc needed — rebuild plan
-            training = cached("training", get_today_metrics)
-            current_ctl = _planning_ctl()
+            if (plan.get("recalc_date") or plan.get("generated", "")) != seen_recalc:
+                # Another recalc or a regenerate wrote the plan meanwhile.
+                return {"action": "fresh", "days_since_recalc": 0, "event_readiness": {}}
 
             # Reconstruct Goal via the canonical helper — the old inline build here
             # dropped distribution/custom_bands/events/block_periodization/
@@ -16865,7 +16970,6 @@ def api_plan_auto_recalc():
 
             # Get eFTP for drift detection
             eftp = None
-            wellness = cached("wellness_7", lambda: fetch_wellness(7))
             if wellness:
                 for w in reversed(wellness):
                     si = w.get("sportInfo", [])
@@ -17413,7 +17517,9 @@ async def api_ride_import(
 
     # v1.0.3 — best-effort auto-reforecast: a FIT import = 1 new ride.
     # Helper swallows all exceptions; the import response stays unchanged.
-    _maybe_auto_reforecast("default", 1)
+    # Off the event loop: it waits for the plan lock (3.13.0 grill).
+    from starlette.concurrency import run_in_threadpool
+    await run_in_threadpool(_maybe_auto_reforecast, "default", 1)
 
     return {
         "ride_id": ride_id,
@@ -19536,7 +19642,8 @@ def api_ride_ftp_test_analysis(ride_id: str):
     if ws is not None and we is not None:
         label = {"coggan_20min": "20-min block (scored)",
                  "ramp": "best sustained minute (scored)",
-                 "sixty_min": "hour plateau (scored)"}.get(kind, "scored window")
+                 "sixty_min": "hour plateau (scored)",
+                 "cp_test": "12-min effort (with the 7 and 3)"}.get(kind, "scored window")
         windows.append({"kind": "scored", "start_s": int(ws), "end_s": int(we), "label": label})
     if suggestion.get("blowout_start_s") is not None:
         windows.append({"kind": "blowout", "start_s": int(suggestion["blowout_start_s"]),

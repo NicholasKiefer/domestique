@@ -9,7 +9,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.12-blue" alt="Python">
   <img src="https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-green" alt="Platform">
-  <img src="https://img.shields.io/badge/Workouts-4307-orange" alt="Workouts">
+  <img src="https://img.shields.io/badge/Workouts-4308-orange" alt="Workouts">
   <img src="https://img.shields.io/badge/Routes-622-purple" alt="Routes">
   <img src="https://img.shields.io/badge/Version-v3.12.2-brightgreen" alt="Version">
   <img src="https://img.shields.io/badge/Tests-3240-success" alt="Tests">

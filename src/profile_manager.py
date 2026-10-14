@@ -95,6 +95,7 @@ _FACTS = {
     # "eftp_auto" is the sustained-drift rule applying an estimate unasked.
     "ftp": _Fact("ftp", "ftp_source", "W", 50, 600, {
         "manual": 2, "tested_coggan_20min": 2, "tested_ramp": 2,
+        "tested_sixty_min": 2, "tested_cp_test": 2,
         "eftp_icu": 1, "eftp_auto": 1, "eftp_local": 1}),
     "wprime": _Fact("wprime_j", "wprime_source", "J", 5000, 40000, {
         "manual": 3, "icu": 2, "monod": 1, "fallback": 0}),
@@ -1034,7 +1035,7 @@ class ProfileManager:
             raise ValueError(f"ftp must be int, got {ftp!r}")
         if not (50 <= ftp <= 600):
             raise ValueError(f"ftp {ftp} out of range [50, 600]")
-        if method not in ("coggan_20min", "ramp", "manual"):
+        if method not in ("coggan_20min", "ramp", "sixty_min", "cp_test", "manual"):
             raise ValueError(f"unknown method {method!r}")
         entry = {
             "date": clock.now(timezone.utc).isoformat().replace("+00:00", "Z"),

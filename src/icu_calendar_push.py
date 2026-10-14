@@ -69,6 +69,7 @@ import json
 import logging
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 import tls_trust  # v3.11.4 — one verifier for every intervals.icu connection
@@ -188,9 +189,13 @@ def _http_error_detail(step: str, status: int, body: bytes) -> str:
 
 # ── plan → desired events ────────────────────────────────────────────────────
 
-def _load_plan() -> dict | None:
+def _plan_path() -> Path:
     import training_planner as tp
-    p = Path(getattr(tp, "PLAN_DIR", domestique_home() / "plans")) / "current_plan.json"
+    return Path(getattr(tp, "PLAN_DIR", domestique_home() / "plans")) / "current_plan.json"
+
+
+def _load_plan(p: "Path | None" = None) -> dict | None:
+    p = p or _plan_path()
     try:
         plan = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, ValueError):
@@ -723,6 +728,149 @@ def _stand_ins(held: dict, by_day: dict, profile_id: str, names) -> dict:
     return out
 
 
+
+def _day_unavailable(plan: dict, day_iso: str) -> bool:
+    """The rider marked the day unavailable (a 0 h day or a holiday/injury/
+    illness period)."""
+    avail = plan.get("availability")
+    if isinstance(avail, dict):
+        v = avail.get(day_iso)
+        if isinstance(v, dict):             # the stored shape: {hours, type}
+            v = v.get("hours")
+        try:
+            if v is not None and not isinstance(v, bool) and float(v) <= 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    for per in plan.get("unavailable_periods") or []:
+        if isinstance(per, dict) and str(per.get("start") or "") <= day_iso <= str(per.get("end") or ""):
+            return True
+    return False
+
+
+def _learnable_moves(held: dict, existing: list, plan: dict, today: date,
+                     names) -> list:
+    """#33: the held moves the plan can follow as if the rider had dragged
+    them in Domestique: [(external_id, from_day, to_day)].
+
+    Only the plain case, everything else stays held (#28 step 1): one event
+    under the id (never a copy), both days today or later and in the same
+    week, the day it left holds exactly that one pending workout, and the
+    day it went to is a rest, empty or vacated day the rider has not marked
+    unavailable, that is no race and that no other move goes to. A move onto
+    a training day is never learned: in intervals.icu the two now share a
+    day, and Domestique cannot tell which of them the rider means to ride.
+
+    Dates read back wrong must never look like moves (a learned move would
+    otherwise walk on, run after run): the event keeps the midnight we wrote
+    (a timezone shift changes the hour, a drag does not), and an event we
+    pushed in the last few minutes that reads back elsewhere is a reading
+    problem, not the rider."""
+    by_day = _sessions_by_day(plan)
+    counts = {}
+    for ev in existing:
+        if isinstance(ev, dict):
+            eid = str(ev.get("external_id") or "")
+            counts[eid] = counts.get(eid, 0) + 1
+    out = []
+    for eid, (enc, n, ev) in held.items():
+        d = _event_day(ev)
+        if counts.get(eid) != 1 or d is None or d < today:
+            continue
+        if str(ev.get("start_date_local") or "")[10:] not in ("", "T00:00:00"):
+            continue
+        pushed = _RECENT_PUSH.get(eid)
+        if pushed and pushed[0] != d.isoformat() and time.monotonic() - pushed[1] < _RECENT_PUSH_S:
+            continue
+        dst = d.isoformat()
+        if enc < today.isoformat() or _iso_week(enc) != _iso_week(dst):
+            continue
+        src_rows, dst_rows = by_day.get(enc) or [], by_day.get(dst) or []
+        if n != 0 or len(src_rows) != 1 or len(dst_rows) > 1:
+            continue
+        src = src_rows[0]
+        if (_is_stub(src) or (src.get("session_type") or "") == "rest"
+                or str(src.get("status") or "pending") != "pending"
+                or src.get("is_race") or _same_workout(src, ev, names) is False):
+            continue
+        if dst_rows and not ((dst_rows[0].get("session_type") or "") == "rest"
+                             or _is_stub(dst_rows[0])):
+            continue
+        if (dst_rows and dst_rows[0].get("is_race")) or _day_unavailable(plan, dst):
+            continue
+        out.append((eid, enc, dst))
+    # Two moves onto one day: the second would land on a training day and
+    # swap -- neither is learned.
+    dsts = [dst for _e, _s, dst in out]
+    return [m for m in out if dsts.count(m[2]) == 1]
+
+
+# #33: the day each event was last pushed on, and when (this process only).
+# An event read back on another day minutes after we wrote it was not moved
+# by the rider: the dates are being read wrong.
+_RECENT_PUSH: dict = {}
+_RECENT_PUSH_S = 600.0
+
+
+def note_pushed(events: list) -> None:
+    now = time.monotonic()
+    for ev in events or []:
+        eid = str(ev.get("external_id") or "")
+        if eid:
+            _RECENT_PUSH[eid] = (str(ev.get("start_date_local") or "")[:10], now)
+
+def _looks_like_a_date_shift(existing: list, profile_id: str, today: date) -> bool:
+    """#33 guard: when most of our events from today on sit off their own
+    day, the dates are being read wrong (a timezone shift), not moved one by
+    one by the rider. Learn nothing then."""
+    prefix = f"{_ID_ROOT}{profile_id}:"
+    total = off = 0
+    for ev in existing:
+        if not isinstance(ev, dict):
+            continue
+        eid = str(ev.get("external_id") or "")
+        d = _event_day(ev)
+        if not eid.startswith(prefix) or d is None or d < today:
+            continue
+        parts = eid[len(prefix):].split(":")
+        total += 1
+        off += parts[0] != d.isoformat()
+    return total >= 2 and off * 2 > total
+
+
+def _learn_moves(existing: list, profile_id: str, today: date, names,
+                 plan_path: Path) -> list:
+    """#33: write the learnable moves into the plan, under the plan lock, on
+    a fresh read. Returns [{external_id, from, to, name}] for what moved.
+    Lock order is the reconcile lock, then the plan lock; no plan-lock holder
+    ever waits for the reconcile lock."""
+    import app as _app
+    import training_planner as tp
+    from profile_manager import ProfileManager
+    learned = []
+    with tp.plan_write_lock():
+        # A profile switch during the run (the GET can take 30 s) must never
+        # write this rider's move into the other rider's plan.
+        if ProfileManager.get().active_id != profile_id:
+            _log.info("EVENT=icu_calendar_learn_skipped reason=profile_switch")
+            return []
+        plan = _load_plan(plan_path)
+        if plan is None:
+            return []
+        held, _agreed = _held_ids(existing, _sessions_by_day(plan), profile_id,
+                                  today, names)
+        for eid, enc, dst in _learnable_moves(held, existing, plan, today, names):
+            moved = _app._apply_move_session(plan, enc, dst)
+            if moved:
+                learned.append({"external_id": eid, "from": enc, "to": dst,
+                                "name": str(moved.get("zwo_name") or moved.get("session_type") or "")})
+        if learned:
+            tp.atomic_write_plan(plan_path, plan)
+    for m in learned:
+        _log.info("EVENT=icu_calendar_move_learned from=%s to=%s", m["from"], m["to"])
+    return learned
+
+
 # #28 (grill_cal M-3): the sync thread, the 30 s debounce timer and the Push
 # button can each start a reconcile; two overlapping bulk upserts of a new
 # external_id could leave two events under one id. One run at a time.
@@ -745,7 +893,7 @@ def _one_at_a_time(timeout_s: float, fn, *args):
         _RECONCILE_LOCK.release()
 
 
-def reconcile(horizon_days: int = HORIZON_DAYS) -> dict:
+def reconcile(horizon_days: int = HORIZON_DAYS, abort_if_swept: bool = True) -> dict:
     """Mirror [today, today+horizon] of the stored plan onto the ICU calendar.
 
     Returns {pushed, updated, deleted, skipped:[{day,reason}], held} plus at
@@ -754,9 +902,26 @@ def reconcile(horizon_days: int = HORIZON_DAYS) -> dict:
     or later left where the rider moved them in intervals.icu (#28); it is 0
     on every early return (W6). Never raises; never writes the plan.
     """
-    out = _one_at_a_time(_RECONCILE_LOCK_TIMEOUT_S, _reconcile, horizon_days)
+    # The rider's own Push (abort_if_swept=False) is never dropped: it asked
+    # for this run after whatever sweep it waited behind.
+    out = _one_at_a_time(_RECONCILE_LOCK_TIMEOUT_S, _reconcile_unless_swept,
+                         horizon_days, _SWEEP_GENERATION if abort_if_swept else None)
     out.setdefault("held", 0)
     return out
+
+
+# A sweep_all (sync turned off, disconnect) bumps this. A reconcile that was
+# already waiting for the lock when the sweep ran must not push everything
+# back afterwards (3.13.0 review): it reads the generation before waiting and
+# gives up, as "swept", when it changed.
+_SWEEP_GENERATION = 0
+
+
+def _reconcile_unless_swept(horizon_days: int, generation: "int | None") -> dict:
+    if generation is not None and generation != _SWEEP_GENERATION:
+        _log.info("EVENT=icu_calendar_push_skipped reason=swept")
+        return _result(error="swept")
+    return _reconcile(horizon_days)
 
 
 def moved_copy_day(athlete_id: str, plan: dict, external_id: str,
@@ -803,13 +968,14 @@ def _reconcile(horizon_days: int) -> dict:
             return _result(error=err)
         if not write_ok(pm):
             return _result(needs_reconnect=True)
-        plan = _load_plan()
+        plan_path = _plan_path()          # #33: this run's rider, fixed
+        plan = _load_plan(plan_path)
         if plan is None:
             return _result(error="no_plan")
         today = clock.today()
         desired, skipped, broken_ids = _desired_events(
             pm, plan, today, horizon_days, profile_id)
-        result = _result(skipped=skipped)
+        result = _result(skipped=skipped, profile_id=profile_id)
         if any(s.get("reason") == "needs_lthr" for s in skipped):
             result["needs_lthr"] = True
 
@@ -832,9 +998,25 @@ def _reconcile(horizon_days: int) -> dict:
         names = functools.lru_cache(maxsize=None)(
             lambda: _load_classifications(Path(_app.WORKOUT_DIR)))
         held, agreed = _held_ids(existing, by_day, profile_id, today, names)
+        # #33 (#28 step 2): a plain move the rider made in intervals.icu is
+        # learned into the plan, as if dragged in Domestique; the agreed-move
+        # rule below then re-keys its event in this same run.
+        result["learned"] = []
+        if (held and _learnable_moves(held, existing, plan, today, names)
+                and not _looks_like_a_date_shift(existing, profile_id, today)):
+            result["learned"] = _learn_moves(existing, profile_id, today, names,
+                                             plan_path)
+            if result["learned"]:
+                plan = _load_plan(plan_path) or plan
+                desired, skipped, broken_ids = _desired_events(
+                    pm, plan, today, horizon_days, profile_id)
+                result["skipped"] = skipped
+                by_day = _sessions_by_day(plan)
+                held, agreed = _held_ids(existing, by_day, profile_id, today, names)
         # W6: a move into the past is still held, but no longer news.
-        result["held"] = sum(1 for _e, _n, ev in held.values()
-                             if _event_day(ev) >= today)
+        learned_ids = {m["external_id"] for m in result["learned"]}
+        result["held"] = sum(1 for eid, (_e, _n, ev) in held.items()
+                             if _event_day(ev) >= today and eid not in learned_ids)
         if held:
             stand_ins = _stand_ins(held, by_day, profile_id, names)
             desired = [ev for ev in desired
@@ -845,6 +1027,13 @@ def _reconcile(horizon_days: int) -> dict:
             status, body = _http(
                 "POST", f"athlete/{athlete_id}/events/bulk?upsert=true",
                 payload=desired)
+            if 200 <= status < 300:
+                # Only what we put on a day it was not on (new or re-dated):
+                # an unchanged re-push must not hide a move the rider makes
+                # right after it.
+                note_pushed([ev for ev in desired
+                             if str((ours.get(ev["external_id"]) or {}).get("start_date_local") or "")[:10]
+                             != ev["start_date_local"][:10]])
             if _scope_403(status, body):
                 result["needs_reconnect"] = True
                 return result
@@ -927,7 +1116,15 @@ def sweep_all(horizon_days: int = HORIZON_DAYS) -> dict:
     held rider moves included, also those moved up to 7 days past the
     horizon (W7: toggle off means everything ours goes). Past days are
     never touched. Waits up to 120 s for a running reconcile. Never raises."""
-    return _one_at_a_time(_SWEEP_LOCK_TIMEOUT_S, _sweep_all, horizon_days)
+    return _one_at_a_time(_SWEEP_LOCK_TIMEOUT_S, _sweep_then_bump, horizon_days)
+
+
+def _sweep_then_bump(horizon_days: int) -> dict:
+    global _SWEEP_GENERATION
+    try:
+        return _sweep_all(horizon_days)
+    finally:
+        _SWEEP_GENERATION += 1
 
 
 def _sweep_all(horizon_days: int) -> dict:
