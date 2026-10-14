@@ -174,3 +174,40 @@ console.log(JSON.stringify([_ftpTypeFromFile('{FILE}'), _ftpTypeFromFile('ftp_te
     res = subprocess.run(["node", "-e", js], capture_output=True, text=True, timeout=30)
     assert res.returncode == 0, res.stderr
     assert json.loads(res.stdout) == ["cp_test", None]
+
+
+def test_a_riders_own_workout_folder_still_finds_the_cp_test(tmp_path, monkeypatch):
+    """Tester report (3.13.0): "the workout is not available in the library".
+    A rider's own workout folder predates the CP test file; the file is found
+    in the built-in library, and nothing is copied or changed."""
+    import json as _json
+    import training_planner as tp
+    import app as app_module
+    from fastapi.testclient import TestClient
+    from test_plan_api import _mk_plan_dict
+    from datetime import date, timedelta
+    own = tmp_path / "my_workouts"
+    own.mkdir()
+    bundled = Path(app_module._BUNDLED_WORKOUT_DIR)
+    for f in ("ftp_test_coggan_3x1min-1min_95pct_59min.zwo", "endurance_steady_68pct_120min.zwo"):
+        (own / f).write_bytes((bundled / f).read_bytes())
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    monkeypatch.setattr(app_module, "WORKOUT_DIR", own)
+    monkeypatch.setattr(tp, "WORKOUT_DIR", own)
+    monkeypatch.setattr(tp, "PLAN_DIR", plans)
+    today = date.today()
+    plan = _mk_plan_dict(today - timedelta(days=today.weekday()))
+    day = plan["weeks"][0]["sessions"][2]
+    day.update(session_type="ftp_test", zwo_file="ftp_test_coggan_3x1min-1min_95pct_59min.zwo")
+    (plans / "current_plan.json").write_text(_json.dumps(plan))
+    client = TestClient(app_module.app)
+    r = client.post("/api/plan/ftp-test-type", json={"date": day["day"], "test_type": "cp_test"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["zwo_file"] == FILE and body["duration_min"] == 110
+    assert body["zwo_name"].startswith("FTP Test — CP 12/7/3")
+    assert not (own / FILE).exists()                       # nothing copied
+    assert app_module._workout_file(FILE) == (bundled / FILE).resolve()
+    assert app_module._workout_file("endurance_steady_68pct_120min.zwo") == (own / "endurance_steady_68pct_120min.zwo").resolve()
+    assert client.get(f"/api/workout/{FILE}/download").status_code in (200, 404)

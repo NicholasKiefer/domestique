@@ -759,12 +759,13 @@ class ProfileManager:
             default_per_profile = self.active_dir / "workouts"
             if training_planner.workout_dir_is_usable(default_per_profile):
                 wp_dir = default_per_profile
-        if wp_dir is None:
-            # Recompute the bundled default from the module location instead
-            # of caching the import-time value — the module global may have
-            # been mutated by an earlier switch (that's the bug).
-            wp_dir = Path(training_planner.__file__).parent / "workouts"
-        training_planner.WORKOUT_DIR = wp_dir
+        # 3.13.1: the built-in library is always the library; the rider's own
+        # folder (user_paths override or <profile>/workouts) adds to it.
+        # Recompute the bundled default from the module location instead of
+        # caching the import-time value — the module global may have been
+        # mutated by an earlier switch (that's the bug).
+        training_planner.WORKOUT_DIR = Path(training_planner.__file__).parent / "workouts"
+        training_planner.EXTRA_WORKOUT_DIR = training_planner.extra_workout_dir_for(wp_dir)
 
     def on_switch(self, callback: Callable) -> None:
         """Register a callback for profile switches."""
