@@ -16765,9 +16765,15 @@ function icuPushToastFromResult(r, verb) {
   const nSkip = (r.skipped || []).length;
   if (nSkip) msg += ' · ' + nSkip + ' skipped';
   // #28: workouts the rider moved in intervals.icu are left there on purpose.
+  // #33: moves made in intervals.icu that the plan now follows.
+  const nLearned = (r.learned || []).length;
+  if (nLearned === 1) msg += ' · 1 workout moved in your plan to match intervals.icu';
+  else if (nLearned > 1) msg += ' · ' + nLearned + ' workouts moved in your plan to match intervals.icu';
   if (r.held === 1) msg += ' · 1 workout kept where you moved it in intervals.icu';
   else if (r.held > 1) msg += ' · ' + r.held + ' workouts kept where you moved them in intervals.icu';
   showToast(msg, 5000, 'success');
+  // The plan changed under the open page: show the moved workouts.
+  if (nLearned && typeof loadPlan === 'function') { try { loadPlan(); } catch (_) {} }
 }
 
 async function icuPushNow() {

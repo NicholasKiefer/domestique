@@ -168,6 +168,10 @@ def env(stub, freeze_clock, monkeypatch):
     (stub.workouts / "vo2.zwo").write_text(STEADY_ZWO, encoding="utf-8")
     stub.fk = WindowedFakeICU()
     monkeypatch.setattr(icp, "_http", stub.fk)
+    # The hold machinery in isolation: #33 learns plain moves into the plan
+    # before the hold applies; tests/test_icu_learn_33.py covers that, these
+    # scenarios included.
+    monkeypatch.setattr(icp, "_learnable_moves", lambda *a, **k: [])
     return stub
 
 

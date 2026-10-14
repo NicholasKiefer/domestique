@@ -723,6 +723,110 @@ def _stand_ins(held: dict, by_day: dict, profile_id: str, names) -> dict:
     return out
 
 
+
+def _day_unavailable(plan: dict, day_iso: str) -> bool:
+    """The rider marked the day unavailable (a 0 h day or a holiday/injury/
+    illness period)."""
+    avail = plan.get("availability")
+    if isinstance(avail, dict):
+        v = avail.get(day_iso)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v <= 0:
+            return True
+    for per in plan.get("unavailable_periods") or []:
+        if isinstance(per, dict) and str(per.get("start") or "") <= day_iso <= str(per.get("end") or ""):
+            return True
+    return False
+
+
+def _learnable_moves(held: dict, existing: list, plan: dict, today: date,
+                     names) -> list:
+    """#33: the held moves the plan can follow as if the rider had dragged
+    them in Domestique: [(external_id, from_day, to_day)].
+
+    Only the plain case, everything else stays held (#28 step 1): one event
+    under the id (never a copy), both days today or later and in the same
+    week, the day it left holds exactly that one pending workout, and the
+    day it went to is a rest, empty or vacated day the rider has not marked
+    unavailable and that is no race. A move onto a training day is never
+    learned: in intervals.icu the two now share a day, and Domestique cannot
+    tell which of them the rider means to ride."""
+    by_day = _sessions_by_day(plan)
+    counts = {}
+    for ev in existing:
+        if isinstance(ev, dict):
+            eid = str(ev.get("external_id") or "")
+            counts[eid] = counts.get(eid, 0) + 1
+    out = []
+    for eid, (enc, n, ev) in held.items():
+        d = _event_day(ev)
+        if counts.get(eid) != 1 or d is None or d < today:
+            continue
+        dst = d.isoformat()
+        if enc < today.isoformat() or _iso_week(enc) != _iso_week(dst):
+            continue
+        src_rows, dst_rows = by_day.get(enc) or [], by_day.get(dst) or []
+        if n != 0 or len(src_rows) != 1 or len(dst_rows) > 1:
+            continue
+        src = src_rows[0]
+        if (_is_stub(src) or (src.get("session_type") or "") == "rest"
+                or str(src.get("status") or "pending") != "pending"
+                or src.get("is_race") or _same_workout(src, ev, names) is False):
+            continue
+        if dst_rows and not ((dst_rows[0].get("session_type") or "") == "rest"
+                             or _is_stub(dst_rows[0])):
+            continue
+        if (dst_rows and dst_rows[0].get("is_race")) or _day_unavailable(plan, dst):
+            continue
+        out.append((eid, enc, dst))
+    return out
+
+
+def _looks_like_a_date_shift(existing: list, profile_id: str, today: date) -> bool:
+    """#33 guard: when most of our events from today on sit off their own
+    day, the dates are being read wrong (a timezone shift), not moved one by
+    one by the rider. Learn nothing then."""
+    prefix = f"{_ID_ROOT}{profile_id}:"
+    total = off = 0
+    for ev in existing:
+        if not isinstance(ev, dict):
+            continue
+        eid = str(ev.get("external_id") or "")
+        d = _event_day(ev)
+        if not eid.startswith(prefix) or d is None or d < today:
+            continue
+        parts = eid[len(prefix):].split(":")
+        total += 1
+        off += parts[0] != d.isoformat()
+    return total >= 3 and off * 2 > total
+
+
+def _learn_moves(existing: list, profile_id: str, today: date, names) -> list:
+    """#33: write the learnable moves into the plan, under the plan lock, on
+    a fresh read. Returns [{external_id, from, to, name}] for what moved.
+    Lock order is the reconcile lock, then the plan lock; no plan-lock holder
+    ever waits for the reconcile lock."""
+    import app as _app
+    import training_planner as tp
+    path = Path(getattr(tp, "PLAN_DIR", domestique_home() / "plans")) / "current_plan.json"
+    learned = []
+    with tp.plan_write_lock():
+        plan = _load_plan()
+        if plan is None:
+            return []
+        held, _agreed = _held_ids(existing, _sessions_by_day(plan), profile_id,
+                                  today, names)
+        for eid, enc, dst in _learnable_moves(held, existing, plan, today, names):
+            moved = _app._apply_move_session(plan, enc, dst)
+            if moved:
+                learned.append({"external_id": eid, "from": enc, "to": dst,
+                                "name": str(moved.get("zwo_name") or moved.get("session_type") or "")})
+        if learned:
+            tp.atomic_write_plan(path, plan)
+    for m in learned:
+        _log.info("EVENT=icu_calendar_move_learned from=%s to=%s", m["from"], m["to"])
+    return learned
+
+
 # #28 (grill_cal M-3): the sync thread, the 30 s debounce timer and the Push
 # button can each start a reconcile; two overlapping bulk upserts of a new
 # external_id could leave two events under one id. One run at a time.
@@ -847,6 +951,20 @@ def _reconcile(horizon_days: int) -> dict:
         names = functools.lru_cache(maxsize=None)(
             lambda: _load_classifications(Path(_app.WORKOUT_DIR)))
         held, agreed = _held_ids(existing, by_day, profile_id, today, names)
+        # #33 (#28 step 2): a plain move the rider made in intervals.icu is
+        # learned into the plan, as if dragged in Domestique; the agreed-move
+        # rule below then re-keys its event in this same run.
+        result["learned"] = []
+        if (held and _learnable_moves(held, existing, plan, today, names)
+                and not _looks_like_a_date_shift(existing, profile_id, today)):
+            result["learned"] = _learn_moves(existing, profile_id, today, names)
+            if result["learned"]:
+                plan = _load_plan() or plan
+                desired, skipped, broken_ids = _desired_events(
+                    pm, plan, today, horizon_days, profile_id)
+                result["skipped"] = skipped
+                by_day = _sessions_by_day(plan)
+                held, agreed = _held_ids(existing, by_day, profile_id, today, names)
         # W6: a move into the past is still held, but no longer news.
         result["held"] = sum(1 for _e, _n, ev in held.values()
                              if _event_day(ev) >= today)
