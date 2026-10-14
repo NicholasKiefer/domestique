@@ -48,17 +48,56 @@ def test_the_library_is_built_in_plus_the_extra_folder(tmp_path, monkeypatch):
     assert CP in files                                     # always there
 
 
-def test_a_copy_of_the_built_in_library_is_never_an_extra_folder(tmp_path):
-    old = tmp_path / "Domestique-3.12.2" / "_internal" / "workouts"
-    old.mkdir(parents=True)
-    (old / "endurance_steady_68pct_120min.zwo").write_text(MINE, encoding="utf-8")
-    (old / ".overhaul_manifest.json").write_text("{}", encoding="utf-8")
-    assert tp.extra_workout_dir_for(old) is None
+def test_only_the_running_built_in_library_is_refused_as_extra(tmp_path):
     assert tp.extra_workout_dir_for(BUNDLED) is None
     empty = tmp_path / "empty"
     empty.mkdir()
     assert tp.extra_workout_dir_for(empty) is None
     assert tp.extra_workout_dir_for(_own_folder(tmp_path)) is not None
+
+
+def _library_copy(root: Path) -> Path:
+    """A copy of an older install's library (its manifest lists its files),
+    with one workout the rider added and one old name the library retired."""
+    old = root / "Domestique-3.12.2" / "_internal" / "workouts"
+    old.mkdir(parents=True)
+    (old / "endurance_steady_68pct_120min.zwo").write_text(MINE, encoding="utf-8")
+    (old / "z2_old_name_60min.zwo").write_text(MINE, encoding="utf-8")
+    (old / "my_hill_repeats.zwo").write_text(MINE, encoding="utf-8")
+    (old / ".overhaul_manifest.json").write_text(json.dumps({"entries": [
+        {"old_filename": "z2_old_name_60min.zwo", "new_filename": "z2_old_name_60min.zwo"},
+        {"old_filename": "x.zwo", "new_filename": "endurance_steady_68pct_120min.zwo"}]}))
+    return old
+
+
+def test_a_library_copy_adds_only_the_riders_own_workouts(tmp_path, monkeypatch):
+    """Grill 3.13.1 M1: a copy that carries the manifest was ignored, so the
+    rider's own additions vanished; old retired names must not come back."""
+    old = _library_copy(tmp_path)
+    assert tp.extra_workout_dir_for(old) == old
+    monkeypatch.setattr(tp, "WORKOUT_DIR", BUNDLED)
+    monkeypatch.setattr(tp, "EXTRA_WORKOUT_DIR", old)
+    files = [w["File"] for w in tp.load_workout_library()]
+    assert "my_hill_repeats.zwo" in files and "z2_old_name_60min.zwo" not in files
+    assert tp.extra_only_names(old, {p.name for p in BUNDLED.glob("*.zwo")}) == {"my_hill_repeats.zwo"}
+
+
+def test_a_riders_own_workout_can_be_planned(tmp_path, monkeypatch):
+    """Grill 3.13.1 H1: the facts gate looked the file up in the built-in
+    folder only, so an extra-folder workout was never scheduled."""
+    import shutil
+    extra = tmp_path / "mine"
+    extra.mkdir()
+    src = next(BUNDLED.glob("endurance_steady_*.zwo"))
+    shutil.copy2(src, extra / "my_own_endurance_ride.zwo")
+    monkeypatch.setattr(tp, "WORKOUT_DIR", BUNDLED)
+    monkeypatch.setattr(tp, "EXTRA_WORKOUT_DIR", extra)
+    rows = tp.load_workout_library()
+    mine = next(r for r in rows if r.get("File") == "my_own_endurance_ride.zwo")
+    twin = next(r for r in rows if r.get("File") == src.name)
+    st = tp._session_type_from_row(twin)
+    assert tp.file_admissible(tp._session_type_from_row(mine), mine)
+    assert tp.file_admissible(st, twin)
 
 
 def test_a_saved_folder_resolves_as_extra_and_the_built_in_stays(stub):
@@ -75,17 +114,41 @@ def test_a_saved_folder_resolves_as_extra_and_the_built_in_stays(stub):
     assert steady.parent == BUNDLED.resolve()
 
 
-def test_an_old_install_path_saved_by_setup_is_ignored(stub):
+def test_an_old_install_path_saved_by_setup_adds_nothing_old(stub):
     import app as app_module
-    old = stub.home / "Downloads" / "Domestique-3.12.2" / "_internal" / "workouts"
-    old.mkdir(parents=True)
-    (old / "z2_old_name_60min.zwo").write_text(MINE, encoding="utf-8")
-    (old / ".overhaul_manifest.json").write_text("{}", encoding="utf-8")
+    old = _library_copy(stub.home)
     (stub.pm.active_dir / "user_paths.json").write_text(json.dumps({"workout_dir": str(old)}))
     stub.pm.apply_training_dirs()
     app_module._apply_profile_paths()
-    assert tp.EXTRA_WORKOUT_DIR is None and app_module.EXTRA_WORKOUT_DIR is None
     assert tp.WORKOUT_DIR.resolve() == BUNDLED.resolve()
+    names = [p.name for p in app_module._library_zwo_paths()]
+    assert "z2_old_name_60min.zwo" not in names and "my_hill_repeats.zwo" in names
+    assert names.count("endurance_steady_68pct_120min.zwo") == 1
+
+
+def test_library_tags_follow_the_extra_folder(stub):
+    """Grill 3.13.1 L1: the tags cache keyed on max(mtime) only."""
+    import app as app_module
+    own = stub.home / "Tagged"
+    own.mkdir()
+    (own / "tagged.zwo").write_text(MINE.replace("<workout>", '<tags><tag name="rider_only_tag"/></tags><workout>', 1))
+    c = stub.client
+    assert "rider_only_tag" not in json.dumps(c.get("/api/workouts/tags").json())
+    assert c.post("/api/settings/workout-folders", json={"extra_dir": str(own)}).status_code == 200
+    assert "rider_only_tag" in json.dumps(c.get("/api/workouts/tags").json())
+    assert c.post("/api/settings/workout-folders", json={"extra_dir": ""}).status_code == 200
+    assert "rider_only_tag" not in json.dumps(c.get("/api/workouts/tags").json())
+
+
+def test_a_quoted_path_and_a_subfolder_hint(stub):
+    own = _own_folder(stub.home)
+    r = stub.client.post("/api/settings/workout-folders", json={"extra_dir": f'"{own}"'})
+    assert r.status_code == 200 and r.json()["extra"]["path"] == str(own)
+    parent = stub.home / "Zwift" / "Workouts"
+    (parent / "12345").mkdir(parents=True)
+    (parent / "12345" / "a.zwo").write_text(MINE)
+    r = stub.client.post("/api/settings/workout-folders", json={"extra_dir": str(parent)})
+    assert r.status_code == 400 and "folder inside it" in r.json()["error"]
 
 
 def test_settings_set_show_and_clear_the_extra_folder(stub):

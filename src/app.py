@@ -1208,11 +1208,11 @@ def _workout_folders_state() -> dict:
     out = {"builtin": {"count": len(builtin)}, "extra": None}
     if extra is not None:
         try:
-            names = [p.name for p in Path(extra).glob("*.zwo")]
+            files = sum(1 for _ in Path(extra).glob("*.zwo"))
         except OSError:
-            names = []
-        out["extra"] = {"path": str(extra), "files": len(names),
-                        "added": sum(1 for n in names if n not in builtin)}
+            files = 0
+        out["extra"] = {"path": str(extra), "files": files,
+                        "added": len(tp.extra_only_names(extra, builtin))}
     return out
 
 
@@ -1229,32 +1229,42 @@ def api_set_extra_workout_folder(body: dict):
     pm = ProfileManager.get()
     if pm.active_id is None:
         return JSONResponse({"error": "No active profile."}, 409)
-    raw = str((body or {}).get("extra_dir") or "").strip()
+    # A pasted path may carry quotes (Windows "Copy as path").
+    raw = str((body or {}).get("extra_dir") or "").strip().strip('"').strip("'").strip()
     if raw:
         p = Path(raw).expanduser()
         if not _setup_path_allowed(p):
             return JSONResponse({"error": "Choose a folder inside your home folder."}, 400)
         if not tp.workout_dir_is_usable(p):
-            return JSONResponse({"error": "That folder has no .zwo workout files."}, 400)
+            sub = p.is_dir() and next(p.glob("*/*.zwo"), None) is not None
+            return JSONResponse({"error": "That folder has no .zwo workout files"
+                                 + ("; they are in a folder inside it, so choose that one." if sub else ".")}, 400)
         if tp.is_builtin_library(p):
             return JSONResponse({"error": "That is Domestique's built-in library, which is always included. Choose a folder with your own workouts."}, 400)
     paths_file = pm.active_dir / "user_paths.json"
-    try:
-        paths = json.loads(paths_file.read_text(encoding="utf-8"))
-        if not isinstance(paths, dict):
+    with _setup_lock:                   # the wizard writes the same file
+        try:
+            paths = json.loads(paths_file.read_text(encoding="utf-8"))
+            if not isinstance(paths, dict):
+                paths = {}
+        except (OSError, json.JSONDecodeError):
             paths = {}
-    except (OSError, json.JSONDecodeError):
-        paths = {}
-    if raw:
-        paths["workout_dir"] = str(Path(raw).expanduser())
-    else:
-        paths.pop("workout_dir", None)
-    tmp = paths_file.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(paths, indent=2), encoding="utf-8")
-    tmp.replace(paths_file)
+        if raw:
+            paths["workout_dir"] = str(Path(raw).expanduser())
+        else:
+            paths.pop("workout_dir", None)
+        try:
+            tmp = paths_file.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(paths, indent=2), encoding="utf-8")
+            tmp.replace(paths_file)
+        except OSError as e:
+            _log.warning("extra workout folder save failed: %s", e)
+            return JSONResponse({"error": "Could not save the setting — try again."}, 500)
     pm.apply_training_dirs()
     _apply_profile_paths()
     clear_cache()
+    global _LIBRARY_TAGS_CACHE
+    _LIBRARY_TAGS_CACHE = None
     _log.info("EVENT=extra_workout_folder set=%s", bool(raw))
     return _workout_folders_state()
 
@@ -5501,11 +5511,8 @@ def _library_zwo_paths() -> list[Path]:
         paths = []
     extra = EXTRA_WORKOUT_DIR
     if extra is not None and Path(extra) != active_workout_dir():
-        have = {p.name for p in paths}
-        try:
-            paths += [p for p in sorted(Path(extra).glob("*.zwo")) if p.name not in have]
-        except OSError:
-            pass
+        only = tp.extra_only_names(extra, {p.name for p in paths})
+        paths += [Path(extra) / n for n in sorted(only)]
     return paths
 
 
@@ -5536,9 +5543,9 @@ def _get_library_tags_cached() -> list[str]:
         mtimes = [p.stat().st_mtime for p in _library_zwo_paths()]
     except OSError:
         mtimes = []
-    sig = max(mtimes) if mtimes else 0.0
+    sig = (str(EXTRA_WORKOUT_DIR), len(mtimes), max(mtimes) if mtimes else 0.0)
     with _LIBRARY_TAGS_LOCK:
-        if _LIBRARY_TAGS_CACHE and abs(_LIBRARY_TAGS_CACHE[0] - sig) < 0.5:
+        if _LIBRARY_TAGS_CACHE and _LIBRARY_TAGS_CACHE[0] == sig:
             return _LIBRARY_TAGS_CACHE[1]
         tags_list = _compute_library_tags()
         _LIBRARY_TAGS_CACHE = (sig, tags_list)
@@ -15976,7 +15983,8 @@ def _execution_for_match(s_json: dict, activity_id) -> "dict | None":
     if zwo:
         try:
             import structure_fidelity as _sf
-            band_segments = _sf.parse_zwo_file(active_workout_dir() / os.path.basename(zwo))
+            band_segments = _sf.parse_zwo_file(_workout_file(os.path.basename(zwo))
+                                               or active_workout_dir() / os.path.basename(zwo))
         except Exception:
             _log.debug("execution band segments unavailable for %s", zwo, exc_info=True)
     try:
@@ -16039,7 +16047,8 @@ def _block_eval_for(s_json: dict, ride: dict) -> "dict | None":
         if not laps or not zwo:
             return None
         import structure_fidelity as _sf
-        path = active_workout_dir() / os.path.basename(zwo)
+        path = (_workout_file(os.path.basename(zwo))
+                or active_workout_dir() / os.path.basename(zwo))
         if not path.exists():
             return None
         segs = _sf.parse_zwo_file(path)

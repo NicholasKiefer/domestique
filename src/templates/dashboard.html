@@ -3300,7 +3300,7 @@ window.addEventListener('unhandledrejection', function(e) {
       <div class="wl-icon" aria-hidden="true">&#128193;</div>
       <div class="wl-main">
         <div class="wl-title">Your extra workouts</div>
-        <div class="wl-sub" id="wl-extra">Add a folder with your own .zwo files. They join the built-in library; nothing is copied or changed.</div>
+        <div class="wl-sub" id="wl-extra">Add a folder with your own .zwo files. They join the built-in library; your files are not changed.</div>
         <div class="wl-path" id="wl-extra-path" style="display:none;"></div>
       </div>
       <div class="wl-actions">
@@ -16087,7 +16087,7 @@ function _wlRender(st) {
     path.textContent = ex.path; path.style.display = '';
     choose.innerHTML = 'Change folder&hellip;'; remove.style.display = '';
   } else {
-    sub.textContent = 'Add a folder with your own .zwo files. They join the built-in library; nothing is copied or changed.';
+    sub.textContent = 'Add a folder with your own .zwo files. They join the built-in library; your files are not changed.';
     path.style.display = 'none';
     choose.innerHTML = 'Choose folder&hellip;'; remove.style.display = 'none';
   }

@@ -122,18 +122,40 @@ EXTRA_WORKOUT_DIR: "Path | None" = None
 
 
 def is_builtin_library(path) -> bool:
-    """3.13.1: is this folder Domestique's own built-in library (this
-    install's, or a copy of an older one)? The setup wizard saved the built-in
-    path as the rider's folder, so many profiles point at an old install's
-    library. Such a folder is never an *extra* folder: the built-in library of
-    the running app always has its workouts, newer and renamed ones included.
-    Recognised by the overhaul manifest only the built-in library ships."""
+    """3.13.1: is this the running app's own built-in library folder? It is
+    always the library, so it is never an extra folder."""
     try:
-        p = Path(path)
-        return (p.resolve() == _BUNDLED_WORKOUT_DIR.resolve()
-                or (p / ".overhaul_manifest.json").is_file())
+        return Path(path).resolve() == _BUNDLED_WORKOUT_DIR.resolve()
     except (OSError, TypeError, ValueError):
         return False
+
+
+def _library_copy_names(path) -> set:
+    """The workout file names a copy of Domestique's library listed when it
+    shipped (its overhaul manifest), so an old install's folder, or a rider's
+    copy of it, adds only the rider's own workouts -- never the old copies of
+    workouts the built-in library has renamed or retired. Empty for a folder
+    that is not such a copy."""
+    try:
+        d = json.loads((Path(path) / ".overhaul_manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return set()
+    out = set()
+    for e in (d.get("entries") or []) if isinstance(d, dict) else []:
+        if isinstance(e, dict):
+            out.update(str(e.get(k) or "") for k in ("old_filename", "new_filename"))
+    out.discard("")
+    return out
+
+
+def extra_only_names(extra, builtin_names) -> set:
+    """3.13.1: the .zwo names in the extra folder that join the library: not
+    in the built-in library, and not a library-copy name (_library_copy_names)."""
+    try:
+        names = {p.name for p in Path(extra).glob("*.zwo")}
+    except OSError:
+        return set()
+    return names - set(builtin_names) - _library_copy_names(extra)
 
 
 def extra_workout_dir_for(path) -> "Path | None":
@@ -1520,7 +1542,7 @@ def file_admissible(slot_type: str, row: dict) -> bool:
     fname = (row.get("File") or "").strip()
     if not fname:
         return True  # rowless/synthetic sessions carry no file to gate
-    f = workout_facts.get_facts(WORKOUT_DIR, fname)
+    f = workout_facts.get_facts(_facts_dir_for(fname), fname)
     if f is None or f.get("null"):
         return False  # A5 fail-closed: a row whose file is missing from the
         # gated library dir, or is unparseable, is inadmissible everywhere.
@@ -4797,12 +4819,30 @@ def load_workout_library() -> list[dict]:
     if hit and hit[0] is rows and hit[1] is extra_rows:
         return hit[2]
     have = {r.get("File") for r in rows}
-    union = rows + [r for r in extra_rows if r.get("File") not in have]
+    copy_names = _library_copy_names(extra)
+    union = rows + [r for r in extra_rows
+                    if r.get("File") not in have and r.get("File") not in copy_names]
     _WORKOUT_LIB_UNION_CACHE[key] = (rows, extra_rows, union)
+    _EXTRA_ONLY_FILES[key] = {r.get("File") for r in union[len(rows):]}
     return union
 
 
 _WORKOUT_LIB_UNION_CACHE: dict = {}
+_EXTRA_ONLY_FILES: dict = {}
+
+
+def _facts_dir_for(fname: str) -> Path:
+    """The folder whose facts describe this workout file: the extra folder
+    for a file only it has (3.13.1), else the built-in library."""
+    extra = EXTRA_WORKOUT_DIR
+    if extra is not None and fname:
+        only = _EXTRA_ONLY_FILES.get((str(WORKOUT_DIR), str(extra)))
+        if only is not None:
+            if fname in only:
+                return Path(extra)
+        elif not (WORKOUT_DIR / fname).is_file() and (Path(extra) / fname).is_file():
+            return Path(extra)
+    return WORKOUT_DIR
 
 
 def _load_library_dir(wd: Path) -> list[dict]:
@@ -7501,7 +7541,7 @@ def sample_week_workouts(ctx: "week_plan.WeekContext", state: "week_plan.PlanSta
                 return False
             if float(w.get("IF", 0) or 0) > _STEPBACK_MAX_IF:
                 return False
-            f = workout_facts.get_facts(WORKOUT_DIR, w.get("File") or "") or {}
+            f = workout_facts.get_facts(_facts_dir_for(w.get("File") or ""), w.get("File") or "") or {}
             # Any time at/above 130% FTP disqualifies a deload draw. Missing
             # facts (unparseable file) fail OPEN to the IF/class verdict above
             # so a facts hiccup can't empty the deload pool.
