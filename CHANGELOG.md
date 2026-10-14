@@ -1,5 +1,22 @@
 # Changelog
 
+## v3.13.1 — Your own workouts, added to the full library (2026-10-14)
+
+This release fixes the Critical Power test for riders who use their own workout folder, and changes what that folder does: from now on it adds workouts to Domestique's library instead of replacing it.
+
+### The built-in library is always there
+
+- **Fixed: choosing the Critical Power test said the workout was not in the library.** Riders who had set their own workout folder in setup were using only that folder, instead of the library that comes with Domestique. A folder set up before 3.13.0 doesn't have the new CP test, so choosing it failed. The same was true for every workout added in a later release.
+- **Your own folder now adds to the library.** Domestique always uses its built-in library, with every workout it ships, the FTP and CP tests included. The workouts in your own folder join it: they show in the workout library and the planner uses them. If your folder has a file with the same name as a built-in workout, the built-in one is used. Your workout files are not changed.
+- **An old install's library is no longer used by mistake.** The setup wizard used to fill in the location of the app's own library and save it. After an update, especially with the Windows download unpacked to a new folder, Domestique kept reading the old version's library. A saved folder that is a copy of Domestique's own library now only adds the workouts you put there yourself, so you always get the current versions of ours, and old or renamed copies don't come back.
+
+### Choose your extra workouts in Settings
+
+- **A new Workout library card in Settings.** It shows the built-in library (always on) and **Your extra workouts**: the folder you add, its path, and how many of its workouts were added to your library.
+- **Choose folder…** opens your computer's own folder picker on macOS, Windows and Linux. Where no picker can open, you can type the folder's path instead. **Remove** stops using the folder; the built-in library stays.
+- **Clear answers when a folder can't be used:** a folder without .zwo workout files (with a hint when they sit in a folder inside it), a folder outside your home folder, or the app's own library. A path pasted with quotes around it works too.
+- In first-time setup the field is now called **Extra workouts folder**, and it starts empty.
+
 ## v3.13.0 — Your moves, your races, a Critical Power test (2026-10-14)
 
 This release is mostly about moving workouts. Whether you drag one in Domestique's Plan tab or in the intervals.icu calendar, it now stays where you put it, and Domestique's plan follows a move you make in intervals.icu. No workout gets lost on the way, and none ends up on two days. It also adds two things riders asked for: loading your races from intervals.icu into the plan builder, and a Critical Power test as a fourth FTP test. Safety fixes come with it: the plan no longer loses a change when two things edit it at once, a rest day is no longer turned into a ride of a few minutes, and a 60-minute test result can now be accepted.
