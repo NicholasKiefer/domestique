@@ -363,10 +363,10 @@ class TestNonRestSessionScalingUnchanged(_AvailRestoreBase):
         # session_type remains long_z2.
         self.assertEqual(after_sat["session_type"], "long_z2",
                          "Non-rest scaling must not change session_type")
-        # 2.5 h asks 150 min; growing Sat (90 TSS of the 260 planned) is
-        # bounded by the 270 budget: 100 TSS of room, 133 min at 45 TSS/h.
-        self.assertEqual(after_sat["duration_min"], 133,
-                         "Sat grows to what the week's budget holds")
+        # 3.13.2 (IP_3.13.2 F): the rider's own 2.5 h in this save, not the
+        # 133 min D5 left in the budget.
+        self.assertEqual(after_sat["duration_min"], 150,
+                         "Sat grows to the rider's hours")
 
 
 class TestPartialRestoreOnlyOneKeyInDict(_AvailRestoreBase):

@@ -101,3 +101,24 @@ def test_the_absence_episode_skips_a_completed_stub():
     g = _gaps(weeks, [], today)
     assert g["consecutive_missed"] >= 2
     assert app_module._current_absence_episode(weeks, g, today) == (1, 2)
+
+
+def _regen_info(weeks, acts, today):
+    clock.freeze(today)
+    try:
+        goal = tp.Goal(goal_type="general", target_date=today + timedelta(weeks=12), hours_per_week=8.0)
+        return tp.regenerate_from_today(goal, weeks, 40.0, activities=acts, seed_salt=1,
+                                        recent_weekly_tss=280.0)[2]
+    finally:
+        clock.unfreeze()
+
+
+def test_a_rebuild_after_a_recovered_gap_adds_no_ramp(_keep_library_index):
+    """IP E: the ramp is sized from the absence still going, not the longest ever."""
+    mon = date(2026, 8, 3)
+    weeks = [_w(n, mon + timedelta(days=7 * (n - 1)), 7, 280) for n in range(1, 7)]
+    ridden = [{"date": (mon + timedelta(days=d)).isoformat(), "tss": 40} for d in range(14, 42)]
+    today = mon + timedelta(days=36)
+    g = _gaps(weeks, ridden, today)
+    assert (g["absence_days"], g["current_absence_days"]) == (14, 0)
+    assert _regen_info(weeks, ridden, today)["recovery_ramp_weeks"] == 0

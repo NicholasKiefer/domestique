@@ -12132,7 +12132,7 @@ def reforecast(
             _budget = float(getattr(pw, "tss_target", 0) or 0)
             _planned = sum(float(s2.tss_estimate or 0) for s2 in pw.sessions
                            if s2.session_type != "rest")
-            _restored_explicit = False
+            _explicit_grew = False
 
             for s in pw.sessions:
                 d_iso = s.day.isoformat()
@@ -12202,7 +12202,7 @@ def reforecast(
                             delattr(s, _k)
                     s.status = "pending"            # a vacated day's stub status
                     if d_iso in _explicit:
-                        _restored_explicit = True
+                        _explicit_grew = True
                 elif getattr(s, "user_swapped", False) or getattr(s, "user_moved", False):
                     # A pinned day — swap-type, accepted redraw, FTP-test
                     # choice — keeps the workout the rider chose. Applying the
@@ -12256,7 +12256,10 @@ def reforecast(
                     if _type_ceil:
                         target_min = min(target_min, _type_ceil)
                     tss_per_h = TSS_PER_HOUR.get(s.session_type, 45)
-                    if target_min > s.duration_min:
+                    # 3.13.2 (IP_3.13.2 F): hours the rider raises in this
+                    # save are followed, the week making room below; every
+                    # other pass grows a day only within the budget (D5).
+                    if target_min > s.duration_min and d_iso not in _explicit:
                         # Growing a day is bounded by the week's budget; a day
                         # that no longer fits simply keeps what it had.
                         target_min = max(s.duration_min,
@@ -12276,6 +12279,8 @@ def reforecast(
                             f"{s.session_type} ({s.duration_min}min) — "
                             f"availability adjusted"
                         )
+                        if d_iso in _explicit and s.duration_min > old_dur:
+                            _explicit_grew = True
                         # v1.7.2 — when the duration change is meaningful
                         # (>= 15 % shrink OR >= 15 % expand), re-match the
                         # ZWO so the loaded workout actually fits the new
@@ -12315,8 +12320,9 @@ def reforecast(
                                     pass
                 touched.add(d_iso)
 
-            if _restored_explicit and _budget > 0 and _planned > _budget:
-                # 3.13.2 (owner): a ride the rider put on a rest day stays;
+            if _explicit_grew and _budget > 0 and _planned > _budget:
+                # 3.13.2 (owner): a ride the rider put on a rest day (or the
+                # hours they raised on a day that rides) stays;
                 # the week's later easy volume makes room for it, so the
                 # week keeps its load. Longest easy session first, never
                 # below the planner's floor; intensity sessions, pinned days
@@ -13470,6 +13476,9 @@ def detect_plan_gaps(
         "missed_count": len(gap_weeks),
         "consecutive_missed": max_consecutive,
         "absence_days": absence_days,
+        # 3.13.2 (IP_3.13.2 E): the missed run still going -- what a rebuild
+        # sizes its ramp from; absence_days is the longest run ever.
+        "current_absence_days": streak_days,
         "current_ctl": round(current_ctl, 1),
         "expected_ctl": round(expected_ctl, 1),
         "ctl_gap": round(expected_ctl - current_ctl, 1),
@@ -13657,7 +13666,9 @@ def regenerate_from_today(
 
     # 2. Detect absence
     gaps = detect_plan_gaps(old_plan_weeks, activities or [], current_ctl)
-    absence_days = gaps["absence_days"]
+    # 3.13.2 (IP_3.13.2 E): the current absence, not the longest one ever --
+    # a rebuild weeks after a recovered gap added a ramp for it.
+    absence_days = gaps["current_absence_days"]
 
     # 3. Calculate remaining time
     if goal.target_date:

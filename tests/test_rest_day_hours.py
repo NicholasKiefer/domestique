@@ -178,3 +178,15 @@ def test_a_learned_move_then_hours_on_the_vacated_day_keeps_one_event_per_workou
     assert env.fk.where(fri0) == [HD["fri"]]
     assert env.fk.files_on() == {HD["mon"]: ["sweet"], HD["wed"]: ["vo2"], HD["fri"]: ["steady"]}
     _one_event_per_session(env)
+
+
+def test_raising_the_hours_on_a_day_that_rides_is_followed_and_the_week_makes_room():
+    """IP F (G8, owner): the added ride from 1 h to 2 h is 2 h; a sync pass
+    with the same calendar grows nothing (D5)."""
+    plan, by = _run(_plan_dict(315), {D[0]: 1.0}, explicit=True)
+    plan, by = _run(plan, {D[0]: 2.0}, explicit=True)
+    assert (by[D[0]]["session_type"], by[D[0]]["duration_min"]) == ("z2", 120)
+    assert _load(by) <= 315 + 1
+    assert (by[D[2]]["duration_min"], by[D[2]]["tss_estimate"]) == (75, 90)   # intensity kept
+    plan, by = _run(plan, {D[0]: 3.0}, explicit=False)
+    assert by[D[0]]["duration_min"] == 120
