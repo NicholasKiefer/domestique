@@ -1219,13 +1219,26 @@ def stepback_due(prior_weeks, phase_name: str, row_end: "date | None" = None) ->
     if row_end is not None and row_end.weekday() + 1 < 4:
         return False
     run = 0
+    # 3.13.2: one count per calendar week. A rebuild keeps the current week's
+    # days before today as a row of its own (IP_3.13.2 D): that row, the
+    # rebuilt rest of the week and the row being decided are one week.
+    seen = _monday_on_or_before(row_end) if row_end is not None else None
     for w in reversed(list(prior_weeks or [])):
+        monday = _monday_on_or_before(_as_date(_field(w)("start")))
+        if monday == seen:
+            continue
+        seen = monday
         if _is_unload_week(w):
             return False
         run += 1
         if run >= STEP_BACK_EVERY - 1:
             return True
     return False
+
+
+def _calendar_weeks(weeks) -> int:
+    """The calendar weeks a list of plan rows covers (see stepback_due)."""
+    return len({_monday_on_or_before(_as_date(_field(w)("start"))) for w in weeks})
 
 
 def _monday_on_or_before(d: date) -> date:
@@ -11877,7 +11890,9 @@ def _last_completed_week_acwr(
     ``tss`` (or ``icu_training_load``) keys.
     """
     today = clock.today()
-    completed = [w for w in plan_weeks if w.end < today]
+    # 3.13.2: a week too short to judge (a rebuild's kept remainder, a
+    # one-day first week) gives no ratio: one ride over plan read as 40.
+    completed = [w for w in plan_weeks if w.end < today and gap_judged_week(w)]
     if not completed:
         return 0.0
     last = max(completed, key=lambda w: w.end)
@@ -13401,6 +13416,7 @@ def detect_plan_gaps(
                 "actual_tss": round(actual),
                 "ratio": round(ratio, 2),
                 "status": status,
+                "days": days,
             })
 
     # The CURRENT week used to contribute nothing — the loop above stops at
@@ -13435,6 +13451,7 @@ def detect_plan_gaps(
                     "ratio": round(actual / planned_to_date, 2),
                     "status": "substantially_missed",
                     "partial_week": True,
+                    "days": elapsed_d,
                 })
 
     # Absence in days: the days of the missed weeks (3.13.2: a short week
@@ -13592,6 +13609,20 @@ def regenerate_from_today(
 
     # 1. Keep past weeks
     past_weeks = [w for w in old_plan_weeks if w.end < today]
+    # 1a. 3.13.2 (IP_3.13.2 D): the current week's days before today are kept
+    # too, as a week of their own ending yesterday. The rebuild starts today,
+    # so they fell out of the plan, and with them the rides done there. The
+    # stepback cadence and the long-ride count read the ended weeks only:
+    # the kept part and the rebuilt rest are one calendar week.
+    kept_weeks = list(past_weeks)
+    _cur = next((w for w in old_plan_weeks if w.start < today <= w.end), None)
+    if _cur is not None:
+        _elapsed = [s for s in _cur.sessions if s.day < today]
+        kept_weeks.append(replace(
+            _cur, end=today - timedelta(days=1), sessions=_elapsed,
+            tss_target=round(sum(float(s.tss_estimate or 0) for s in _elapsed
+                                 if s.session_type != "rest")),
+            net_tss_target=None))
 
     # 1b. Gather any adapted / user-moved / status-tracked sessions from the
     # CURRENT week of the old plan (fix26 §6.12).
@@ -13766,14 +13797,14 @@ def regenerate_from_today(
     new_weeks = []
     used_names_dict: dict[str, int] = {}
     used_names_set: set = set()
-    week_num = len(past_weeks) + len(recovery_weeks) + 1
+    week_num = len(kept_weeks) + len(recovery_weeks) + 1
     # Seed cross-week 48h HIT-gap (PL2) with the Sunday of whichever prior
     # week is most recent: last recovery week → last past week → None.
     prev_week_sessions: list | None = None
     if recovery_weeks:
         prev_week_sessions = recovery_weeks[-1].sessions
-    elif past_weeks:
-        prev_week_sessions = past_weeks[-1].sessions
+    elif kept_weeks:
+        prev_week_sessions = kept_weeks[-1].sessions
 
     # v4.5.0 Layer 3 rolling 4-week HIT-type window per phase.
     recent_hit_by_phase: dict[str, list[str]] = {}
@@ -13960,7 +13991,7 @@ def regenerate_from_today(
         # recovery, the same count week_num is seeded from above) — otherwise a
         # mid-plan regen resets the long ride to long_start_h instead of
         # continuing from where the athlete already is.
-        _elapsed_weeks = len(past_weeks) + len(recovery_weeks)
+        _elapsed_weeks = _calendar_weeks(past_weeks) + len(recovery_weeks)
         for _wi, _w in enumerate(new_weeks):
             if getattr(_w, "phase", "") == "taper":
                 continue
@@ -13984,9 +14015,9 @@ def regenerate_from_today(
 
     # Renumber recovery weeks
     for i, rw in enumerate(recovery_weeks):
-        rw.week_num = len(past_weeks) + i + 1
+        rw.week_num = len(kept_weeks) + i + 1
 
-    all_weeks = past_weeks + recovery_weeks + new_weeks
+    all_weeks = kept_weeks + recovery_weeks + new_weeks
 
     regen_info = {
         "absence_days": absence_days,
@@ -14534,7 +14565,7 @@ def recalculate_plan(
     # ride (the <= 21 gate matches both other sites).
     if event_targets is not None:
         _mw_min = int(round((goal.max_weekend_hours or 0) * 60))
-        _elapsed_weeks = len(past_weeks)
+        _elapsed_weeks = _calendar_weeks(past_weeks)
         for _wi, _w in enumerate(new_weeks):
             if getattr(_w, "phase", "") == "taper":
                 continue

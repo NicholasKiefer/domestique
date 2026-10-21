@@ -12592,8 +12592,14 @@ def _apply_plan_update(
     # ANYWHERE in history), which would mis-key the latch whenever an older,
     # longer, already-recovered gap exists.
     if episode is not None:
-        episode_weeks = episode[1] - episode[0] + 1
-        episode_key = f"{episode[0]}:{_ramp_band(episode_weeks * 7)}"
+        # 3.13.2 (IP_3.13.2 GD4): the band from the episode's missed days,
+        # the current week's included, as the ramp is sized. In weeks of
+        # finished weeks only, it moved once a rebuild kept the current
+        # week's elapsed days as a finished week: a second rebuild next sync.
+        episode_days = sum(gw["days"] for gw in gaps.get("gap_weeks", [])
+                           if episode[0] <= gw["week_num"] <= episode[1]
+                           or gw.get("partial_week"))
+        episode_key = f"{episode[0]}:{_ramp_band(episode_days)}"
     else:
         episode_key = f"ctl:{round(ctl_gap / 5.0) * 5}"
     latched = (plan.get("gap_regen_latch", {}) or {}).get("key") == episode_key
