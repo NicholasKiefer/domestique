@@ -14,8 +14,8 @@ shown separately from successful credential verification.
 
 ## Install on your Pixel
 
-Download the `domestique-pixel-debug-apk` artifact from the **Android APK** GitHub
-Actions run, unzip it, and open `app-debug.apk` on the phone. Allow your browser
+Download the APK from the Android testing prerelease in **GitHub Releases**.
+CI build artifacts are also available for a fresh install. Open the APK on the phone. Allow your browser
 or Files app to “Install unknown apps” when Android asks.
 
 With USB debugging enabled, you can instead use:
@@ -33,8 +33,13 @@ picker; ZWO, FIT, CRS and other exports use Android's Save dialog.
 
 This is a debug-signed testing APK, not a Play Store release. Reinstalling an APK
 with the **same signing key** keeps data; uninstalling deletes local athlete data.
-GitHub-hosted debug signing keys can change between runs: export any data you need
-before switching signing keys. Local Gradle builds reuse your local debug key.
+GitHub-hosted debug signing keys change between runs, so CI artifacts may require
+a fresh install. The locally published testing prerelease uses a retained private
+test key at `.signing/domestique-test.keystore` (excluded from Git). Keep this file
+to sign subsequent updates of that APK. Without it Gradle uses the local SDK debug
+key. Production distribution needs its own release-signing setup. An APK signed
+with a different key cannot update an installed copy; preserve athlete data before
+uninstalling. GitHub's contents permission does not grant repository-secret access.
 
 ## Build locally
 
