@@ -64,6 +64,7 @@ IP_*.md
 .oauth.env
 .venv-build
 .venv-android/
+.signing/
 .python-build/
 
 # Scrape tooling + artifacts — kept locally, not distributed (provenance is the
