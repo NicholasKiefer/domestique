@@ -63,6 +63,7 @@ IP_*.md
 # OAuth client secret — NEVER commit (public repo)
 .oauth.env
 .venv-build
+.venv-android/
 .python-build/
 
 # Scrape tooling + artifacts — kept locally, not distributed (provenance is the

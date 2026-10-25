@@ -1,0 +1,56 @@
+plugins {
+    id 'com.android.application'
+    id 'com.chaquo.python'
+}
+
+android {
+    namespace 'com.domestique.android'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'com.domestique.android'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0-alpha'
+        // Pixels are ARM64. Override for an emulator: -PandroidAbi=x86_64
+        ndk { abiFilters(project.findProperty('androidAbi') ?: 'arm64-v8a') }
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+    }
+    buildFeatures { buildConfig true }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    sourceSets.main.assets.srcDir(layout.buildDirectory.dir('generated/backend'))
+}
+
+dependencies {
+    androidTestImplementation 'androidx.test:runner:1.6.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+}
+
+chaquopy {
+    defaultConfig {
+        // scipy's Android wheel is currently available for Python 3.10.
+        version = '3.10'
+        if (project.hasProperty('buildPython')) buildPython(project.property('buildPython'))
+        pip { install('-r', 'requirements.txt') }
+    }
+}
+
+// Package the real backend and library, not a second implementation of the planner.
+// Extracted to app-private storage at runtime because the app uses pathlib/glob.
+def backendZip = tasks.register('bundleBackend', Zip) {
+    from('../../src') {
+        into 'src'
+        exclude '**/__pycache__/**', '**/*.pyc', '**/.env', '**/.oauth.env'
+        exclude 'launcher.py', 'gpx_sources/**'
+        exclude 'workouts/.library_index.json', 'workouts/.workout_facts.json'
+    }
+    from('../..') { include 'VERSION', 'LICENSE', 'NOTICE' }
+    archiveFileName = 'backend.zip'
+    destinationDirectory = layout.buildDirectory.dir('generated/backend')
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+}
+tasks.named('preBuild').configure { dependsOn backendZip }
