@@ -4,6 +4,7 @@
 import importlib.util
 from pathlib import Path
 import zipfile
+import json
 
 import pytest
 
@@ -55,3 +56,15 @@ def test_incomplete_install_is_replaced(tmp_path):
     (installed / "src/app.py").write_text("incomplete")
     backend.unpack_backend(bundle, tmp_path / "runtime")
     assert (installed / "src/app.py").read_text() == "version one"
+
+
+def test_bundled_index_matches_extracted_file_timestamps(tmp_path):
+    bundle = tmp_path / "backend.zip"
+    make_bundle(bundle)
+    with zipfile.ZipFile(bundle, "a") as archive:
+        archive.writestr("src/workouts/.library_index.json", json.dumps({
+            "count": 1, "max_mtime": 0, "rows": [{"File": "example.zwo"}]}))
+    installed = backend.unpack_backend(bundle, tmp_path / "runtime")
+    index = json.loads((installed / "src/workouts/.library_index.json").read_text())
+    assert index["max_mtime"] == (installed / "src/workouts/example.zwo").stat().st_mtime
+    assert index["rows"] == [{"File": "example.zwo"}]

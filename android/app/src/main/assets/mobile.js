@@ -65,6 +65,16 @@
         input.value = '';
         status.textContent = `Connected as ${check.name || check.athlete_id}.`;
         if (typeof window.loadIcuConnection === 'function') window.loadIcuConnection();
+        status.textContent += ' Syncing wellness and activities…';
+        const sync = await post('/api/sync', {});
+        if (sync.status !== 'ok') throw new Error(
+          'Connected, but sync failed: ' + (sync.error || sync.status || 'unknown error'));
+        status.textContent = `Connected as ${check.name || check.athlete_id}. ` +
+          `Synced ${sync.wellness || 0} wellness records and ${sync.activities || 0} activities.`;
+        if (typeof window.forgetInflight === 'function') window.forgetInflight();
+        if (typeof window.loadHome === 'function') window.loadHome();
+        if (typeof window.loadPlanMetrics === 'function') window.loadPlanMetrics();
+        if (typeof window.startSyncProgressWatch === 'function') window.startSyncProgressWatch(6);
       } catch (error) { status.textContent = error.message; }
       finally { button.disabled = false; }
     };

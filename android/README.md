@@ -5,6 +5,13 @@ the shared FastAPI backend on `127.0.0.1` inside the Android process. No desktop
 server, Termux, or hosted account is required. It bundles the workout and route
 libraries and stores athlete data in the app's private files directory.
 
+Version 0.1.1 bundles the generated workout index and facts so opening the
+Training Plan does not rebuild 4,308 workouts on the phone. Foreground Android
+views use synced local wellness/activity records; explicit sync and background
+workers still contact Intervals.icu. Connecting an API key runs the initial
+wellness/activity sync and refreshes the displayed metrics. Sync failures are
+shown separately from successful credential verification.
+
 ## Install on your Pixel
 
 Download the `domestique-pixel-debug-apk` artifact from the **Android APK** GitHub
