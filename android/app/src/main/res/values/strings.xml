@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="starting">Starting Domestique…\nThe first launch unpacks your workout library.</string>
+    <string name="startup_failure">Domestique could not start.\n\n%1$s</string>
+    <string name="retry">Retry</string>
+</resources>
