@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Android-only bootstrap; the existing backend remains shared with desktop."""
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -36,6 +37,17 @@ def unpack_backend(archive, runtime_dir):
                     if not dest.is_relative_to(stage.resolve()):
                         raise ValueError("Invalid backend archive path")
                 bundle.extractall(stage)
+            # ZIP extraction changes filesystem timestamps, while the generated
+            # library index validates against (count, max_mtime). The immutable
+            # bundled bytes are unchanged: bind its index to the extracted files.
+            index_path = stage / "src/workouts/.library_index.json"
+            if index_path.exists():
+                index = json.loads(index_path.read_text())
+                workouts = list((stage / "src/workouts").glob("*.zwo"))
+                if index.get("count") != len(workouts):
+                    raise ValueError("Bundled workout index does not match the library")
+                index["max_mtime"] = max((p.stat().st_mtime for p in workouts), default=0)
+                index_path.write_text(json.dumps(index), encoding="utf-8")
             (stage / ".complete").touch()
             shutil.rmtree(target, ignore_errors=True)
             stage.rename(target)

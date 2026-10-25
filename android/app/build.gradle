@@ -10,8 +10,8 @@ android {
         applicationId 'com.domestique.android'
         minSdk 26
         targetSdk 35
-        versionCode 1
-        versionName '0.1.0-alpha'
+        versionCode 2
+        versionName '0.1.1-alpha'
         // Pixels are ARM64. Override for an emulator: -PandroidAbi=x86_64
         ndk { abiFilters(project.findProperty('androidAbi') ?: 'arm64-v8a') }
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
@@ -40,12 +40,18 @@ chaquopy {
 
 // Package the real backend and library, not a second implementation of the planner.
 // Extracted to app-private storage at runtime because the app uses pathlib/glob.
+def libraryCaches = tasks.register('prepareLibraryCaches', Exec) {
+    workingDir '../..'
+    commandLine(project.findProperty('buildPython') ?: 'python3.10', 'tools/build-library-caches.py')
+    inputs.files(fileTree('../../src') { include '*.py', 'scripts/*.py', 'workouts/*.zwo' })
+    outputs.files('../../src/workouts/.library_index.json', '../../src/workouts/.workout_facts.json')
+}
 def backendZip = tasks.register('bundleBackend', Zip) {
+    dependsOn libraryCaches
     from('../../src') {
         into 'src'
         exclude '**/__pycache__/**', '**/*.pyc', '**/.env', '**/.oauth.env'
         exclude 'launcher.py', 'gpx_sources/**'
-        exclude 'workouts/.library_index.json', 'workouts/.workout_facts.json'
     }
     from('../..') { include 'VERSION', 'LICENSE', 'NOTICE' }
     archiveFileName = 'backend.zip'

@@ -350,6 +350,9 @@ def fetch_wellness(days: int = 42) -> list[dict]:
     Retry-After. FastAPI handlers call this via app.cached(), which already
     falls back to stale cache / {} on any exception.
     """
+    import icu_snapshot
+    if icu_snapshot.prefer_local.get():
+        return icu_snapshot.wellness(days)
     try:
         _require_credentials()
     except ICUCredentialsMissing:
@@ -381,6 +384,9 @@ def fetch_activities(days: int = 14) -> list[dict]:
     the background sync loop can react. FastAPI handlers call this via
     app.cached(), which swallows exceptions into stale cache.
     """
+    import icu_snapshot
+    if icu_snapshot.prefer_local.get():
+        return icu_snapshot.activities(days)
     try:
         _require_credentials()
     except ICUCredentialsMissing:

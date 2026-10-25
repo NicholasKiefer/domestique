@@ -23,6 +23,12 @@ def main():
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with tempfile.TemporaryDirectory(prefix="domestique-android-smoke-") as files:
         url = android_backend.start(archive, files)
+        # A cold install must accept its bundled index. Otherwise the first
+        # Plan read repeats the 4,308-file XML/1 Hz computation on the phone.
+        import training_planner as tp
+        paths = list(tp.WORKOUT_DIR.glob("*.zwo"))
+        index = tp._read_library_index(len(paths), max(p.stat().st_mtime for p in paths))
+        assert index and len(index) == len(paths), "Bundled library index was rejected"
 
         def request(path, payload=None):
             req = urllib.request.Request(

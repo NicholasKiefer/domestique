@@ -3733,7 +3733,7 @@ document.querySelectorAll('.tab[data-tab]').forEach(t => {
     document.querySelectorAll('.tab[data-tab]').forEach(t2 => t2.classList.remove('active'));
     t.classList.add('active');
     section.classList.add('active');
-    const loaders = {courses:()=>{
+    const loaders = {home:()=>loadHome(), courses:()=>{
                        // Default to the currently-selected source (All Routes on first visit)
                        if (_courseSource === 'virtual') loadVirtualRoutes();
                        else if (_courseSource === 'all') loadAllRoutes();
@@ -5921,6 +5921,10 @@ async function _syncProgressTick(idleTicks) {
       : 'Sync complete · up to date';
     setTimeout(() => _setSyncTopbar(0, 0, true), 2500);
     _syncProgressTimer = null; _syncProgressSawWork = false;
+    // Background sync invalidates server caches; repaint the values that were
+    // loaded before the first sync, rather than leaving an offline snapshot.
+    loadHome().catch(() => {});
+    loadPlanMetrics().catch(() => {});
     return;
   }
   if (idleTicks > 0) {  // sync may not have started yet — keep watching a bit
@@ -14069,6 +14073,9 @@ async function syncNowAction(btnId) {
       const added = Number(payload.added || 0);
       const wAdded = Number(payload.wellness_added || 0);
       showToast(`Synced: ${added} new ride${added === 1 ? '' : 's'}, ${wAdded} wellness record${wAdded === 1 ? '' : 's'}${tail}`, 4000);
+      forgetInflight();
+      loadHome().catch(() => {});
+      loadPlanMetrics().catch(() => {});
     } else if (status === 'throttled') {
       const mins = Number(payload.minutes_until_next_sync || 0);
       const minTxt = mins > 0 ? `${mins} min` : 'a few min';

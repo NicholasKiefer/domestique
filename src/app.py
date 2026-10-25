@@ -752,6 +752,22 @@ async def lifespan(app):
 app = FastAPI(title="Domestique", version=_VERSION, lifespan=lifespan)
 
 
+@app.middleware("http")
+async def android_local_reads(request, call_next):
+    # Foreground mobile screens must not wait through ICU's network retries.
+    # Explicit sync/credential checks and background threads still fetch ICU.
+    from icu_snapshot import prefer_local
+    path = request.url.path
+    local = os.environ.get("DOMESTIQUE_PLATFORM") == "android" and (
+        (request.method in ("GET", "HEAD") and path.startswith("/api/"))
+        or path.startswith("/api/plan/"))
+    token = prefer_local.set(local)
+    try:
+        return await call_next(request)
+    finally:
+        prefer_local.reset(token)
+
+
 # Global exception handler — catches unhandled errors and logs them
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse as StarletteJSONResponse
@@ -8027,6 +8043,8 @@ def _after_background_sync() -> None:
     """db.post_sync_callback: what follows each pass of the 30-min sync loop.
     The daily calendar reconcile, and the F5 eFTP auto-apply (opt-in, behind
     the plausibility guard), which /api/weekly-plan used to run on a read."""
+    if os.environ.get("DOMESTIQUE_PLATFORM") == "android":
+        clear_cache()
     _icu_push_daily_from_sync()
     try:
         from profile_manager import ProfileManager
@@ -9001,6 +9019,8 @@ def api_sync():
     session. run_sync re-raises on failure, so this only runs on success.
     """
     result = db.run_sync(days=90)
+    if result.get("status") == "ok":
+        clear_cache()
     if db._auth_disabled:
         db.restart_sync()
     return result
@@ -18900,6 +18920,13 @@ def api_rides_sync(force: int = Query(0)):
     a same-day ride's TSS exceeds today's planned tss_estimate by >1.5×
     (Foster 1998 session-load spike). Read-only — does not mutate the plan.
     """
+    if force and os.environ.get("DOMESTIQUE_PLATFORM") == "android":
+        # Mobile foreground reads use SQLite. Refresh that snapshot as well
+        # as the FIT/wellness file store this endpoint normally updates.
+        snapshot_result = db.run_sync(days=90)
+        if snapshot_result.get("status") != "ok":
+            return {"status": "fetch_failed", "error": snapshot_result.get("error") or "Sync failed"}
+        clear_cache()
     # The sync fetches; this handler adapts, once (it did twice: inside the
     # sync and again below, the second finding the day already stamped).
     if force:
