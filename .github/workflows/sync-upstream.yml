@@ -1,0 +1,57 @@
+name: Sync upstream into mobile
+on:
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+concurrency:
+  group: sync-mobile-upstream
+  cancel-in-progress: false
+jobs:
+  sync:
+    if: github.repository == 'NicholasKiefer/domestique'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mobile-app
+          fetch-depth: 0
+      - name: Prepare upstream integration
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/platypus45/domestique.git
+          upstream_branch=$(gh api repos/platypus45/domestique --jq .default_branch)
+          git fetch upstream "$upstream_branch"
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo 'Already up to date.'
+            exit 0
+          fi
+          git switch -C sync/mobile-upstream
+          if ! git merge --no-edit FETCH_HEAD; then
+            git merge --abort
+            echo '::error::Upstream conflicts with mobile-app. Resolve locally using android/UPSTREAM.md.'
+            exit 1
+          fi
+          git push --force-with-lease origin sync/mobile-upstream
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+          existing=$(gh pr list --base mobile-app --head sync/mobile-upstream --json number --jq 'length')
+          if [ "$existing" = 0 ]; then
+            gh pr create --draft --base mobile-app --head sync/mobile-upstream \
+              --title 'Integrate latest upstream into Android' \
+              --body 'Updates the shared backend from upstream while preserving Android changes. Run the Android APK workflow on sync/mobile-upstream, review its results, and test the APK before merging. Conflicts require local resolution; see android/UPSTREAM.md.'
+          fi
+      # GITHUB_TOKEN pushes do not trigger other workflows. Dispatch explicitly.
+      - name: Build integration APK
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run android.yml --ref sync/mobile-upstream
