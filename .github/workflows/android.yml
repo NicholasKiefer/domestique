@@ -4,7 +4,7 @@ on:
   pull_request:
     paths: ['android/**', 'src/**', '.github/workflows/android.yml']
   push:
-    branches: ['android/**']
+    branches: ['android/**', 'mobile-app', 'sync/mobile-upstream']
     paths: ['android/**', 'src/**', '.github/workflows/android.yml']
 
 permissions:

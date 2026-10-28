@@ -6,13 +6,34 @@
   const style = document.createElement('style');
   style.textContent = `
     #setup-connect-btn, #icu-connect-btn { display: none !important; }
-    @media (max-width: 600px) {
+    #android-navigation { display: none; }
+    @media (max-width: 800px) {
+      #tabs { display: none; }
+      #android-navigation { display: flex; align-items: center; gap: 12px;
+        position: sticky; top: 0; z-index: 20; padding: 8px;
+        background: var(--surface); border-bottom: 1px solid var(--border); }
+      #android-navigation select { flex: 1; min-width: 0; min-height: 44px;
+        background: var(--surface2); color: var(--text); border: 1px solid var(--border);
+        border-radius: 7px; padding: 8px; }
+      .cal-wrap { min-width: 0; }
+      .cal-toolbar { flex-wrap: wrap; }
+      .cal-toolbar .cal-tab { min-height: 44px; display: flex; align-items: center; }
+      .cal-scroll { overflow-x: auto; overscroll-behavior-x: contain; }
+      .cal-week-grid, .cal-row { min-width: 970px;
+        grid-template-columns: 110px repeat(7, minmax(116px, 1fr)); }
+      #weekly-calendar { grid-template-columns: repeat(7, minmax(116px, 1fr)) !important;
+        overflow-x: auto; overscroll-behavior-x: contain; }
+      #plan-calendar { overflow-x: auto; }
+      #plan-calendar > * { min-width: 970px; }
+      #ps-kpi-row, #ps-charts, #ps-totals, #cap-kpi-tiles {
+        grid-template-columns: minmax(0, 1fr) !important; }
+
       .container { padding: 8px; }
       header { flex-wrap: wrap; gap: 10px; }
       .header-stats { flex-wrap: wrap; gap: 12px; }
       .grid.g2, .grid.g3, .grid.g4 { grid-template-columns: minmax(0, 1fr); }
       .card { padding: 12px; min-width: 0; overflow-x: auto; }
-      .tabs { position: sticky; top: 0; z-index: 20; }
+
       .tab { min-height: 44px; display: flex; align-items: center; }
       input, select, textarea { font-size: 16px !important; max-width: 100%; }
       button, .btn { min-height: 44px; }
@@ -22,6 +43,49 @@
     }
   `;
   document.head.appendChild(style);
+
+  // Reuse upstream tab handlers so loading and state stay in one place.
+  const tabs = document.getElementById('tabs');
+  if (tabs) {
+    const navigation = document.createElement('nav');
+    navigation.id = 'android-navigation';
+    navigation.setAttribute('aria-label', 'Main navigation');
+    const label = document.createElement('label');
+    label.htmlFor = 'android-section';
+    label.textContent = 'View';
+    const select = document.createElement('select');
+    select.id = 'android-section';
+    const tabButtons = [...tabs.querySelectorAll('[data-tab]')];
+    for (const tab of tabButtons) {
+      select.add(new Option(tab.textContent.trim(), tab.dataset.tab));
+    }
+    const reflectActiveTab = () => {
+      const active = tabButtons.find(tab => tab.classList.contains('active'));
+      if (active) select.value = active.dataset.tab;
+    };
+    select.addEventListener('change', () => {
+      tabButtons.find(tab => tab.dataset.tab === select.value)?.click();
+      window.scrollTo({top: 0, behavior: 'instant'});
+      reflectActiveTab();
+    });
+    new MutationObserver(reflectActiveTab).observe(tabs, {
+      subtree: true, attributes: true, attributeFilter: ['class']
+    });
+    navigation.append(label, select);
+    // Outside cards/scroll containers so the navigation sticks to the viewport.
+    document.body.prepend(navigation);
+    reflectActiveTab();
+    const calendar = document.getElementById('cal-body');
+    if (calendar) {
+      calendar.tabIndex = 0;
+      calendar.setAttribute('role', 'region');
+      calendar.setAttribute('aria-label', 'Training calendar. Swipe horizontally to see all days.');
+      const hint = document.createElement('p');
+      hint.textContent = 'Swipe the calendar sideways to see all days.';
+      hint.style.cssText = 'font-size:12px;color:var(--text2);margin:8px 0;';
+      calendar.before(hint);
+    }
+  }
 
   const setupStatus = document.getElementById('setup-link-status');
   if (setupStatus) setupStatus.textContent =

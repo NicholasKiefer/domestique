@@ -91,3 +91,13 @@ adb shell am force-stop com.domestique.android
 adb shell monkey -p com.domestique.android 1
 adb logcat -d -s Domestique python.stdout python.stderr AndroidRuntime
 ```
+
+## Mobile navigation and updates
+
+Version 0.1.2 adds a sticky **View** menu on phone/tablet widths so every screen
+is reachable without scrolling through desktop tabs. The training calendar
+keeps readable day columns in its own horizontal scrolling area; swipe sideways
+to see later days. Calendar controls wrap, and summary tiles stack on phones.
+
+Development continues on `mobile-app`. See [UPSTREAM.md](UPSTREAM.md) for the
+daily upstream check, draft integration PRs, and manual update commands.
