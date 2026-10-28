@@ -18,7 +18,7 @@ This is an early testing build. See the Android documentation for supported devi
 - **`mobile-app`**: default branch for Android development and builds.
 - **`clean-main`**: protected upstream baseline; Android changes belong on `mobile-app`.
 
-Daily checks fast-forward `clean-main` from upstream and prepare draft integration PRs for `mobile-app`. Review and test the Android APK before merging those PRs.
+Weekly checks (Mondays at 06:23 UTC) fast-forward `clean-main` from upstream and prepare draft integration PRs for `mobile-app`. Review and test the Android APK before merging those PRs.
 
 ## Attribution and license
 

@@ -4,9 +4,8 @@ Upstream's default branch is `clean-main` (not `main`). `mobile-app` is the
 long-lived Android branch and the fork’s default branch. `clean-main` is a
 protected upstream baseline; do not merge Android PRs into it. Keep Android-specific code under `android/` and
 minimize changes in shared Python/templates to reduce update conflicts.
-The original `android/pixel-apk` branch remains as a historical reference.
 
-The **Sync upstream into mobile** workflow runs daily at 06:23 UTC and can also
+The **Sync upstream into mobile** workflow runs weekly on Mondays at 06:23 UTC and can also
 be run manually. It detects upstream's default branch, fast-forwards
 `clean-main` (refusing divergent history), then merges new commits into
 `sync/mobile-upstream`, opens a draft PR targeting `mobile-app`, and explicitly
