@@ -101,3 +101,12 @@ to see later days. Calendar controls wrap, and summary tiles stack on phones.
 
 Development continues on `mobile-app`. See [UPSTREAM.md](UPSTREAM.md) for the
 daily upstream check, draft integration PRs, and manual update commands.
+
+## In-app update prompt
+
+Android 0.1.3 adds a launch-time update prompt and a manual check in Settings.
+**Update now** opens the APK download; Android asks you to confirm installation.
+After the [one-time signing setup](UPDATES.md), successful `mobile-app` builds
+publish automatically to the Android development channel. Install this version
+once manually to enable future prompts. Desktop update notices are hidden on
+Android. See [UPDATES.md](UPDATES.md) for signing, migration and release details.

@@ -35,6 +35,7 @@ public class MainActivity extends Activity {
     private static final int PICK_FILE = 10, SAVE_FILE = 11;
     private static final int MAX_EXPORT = 32 * 1024 * 1024;
     private WebView web;
+    private AndroidUpdates updates;
     private String origin;
     private ValueCallback<Uri[]> filePicker;
     private byte[] pendingExport;
@@ -43,6 +44,7 @@ public class MainActivity extends Activity {
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         savedWebState = state;
+        updates = new AndroidUpdates(this);
         // Keep the web content outside system bars, including Android 15 edge-to-edge.
         getWindow().getDecorView().setOnApplyWindowInsetsListener((view, insets) -> {
             view.setPadding(insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetTop(),
@@ -154,6 +156,10 @@ public class MainActivity extends Activity {
 
     private class ExportBridge {
         // Only local pages are loaded. Never expose this bridge to external origins.
+        @JavascriptInterface public void checkUpdates() {
+            runOnUiThread(() -> updates.check(true));
+        }
+
         @JavascriptInterface public void save(String name, String base64, String mime) {
             if (base64.length() > MAX_EXPORT * 4L / 3 + 8) return;
             try {
@@ -227,6 +233,11 @@ public class MainActivity extends Activity {
             if (out.size() == limit) break;
         }
         return out.toByteArray();
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        if (updates != null) updates.check(false);
     }
 
     @Override public void onBackPressed() {

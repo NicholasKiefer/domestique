@@ -6,6 +6,7 @@
   const style = document.createElement('style');
   style.textContent = `
     #setup-connect-btn, #icu-connect-btn { display: none !important; }
+    #update-banner { display: none !important; }
     #android-navigation { display: none; }
     @media (max-width: 800px) {
       #tabs { display: none; }
@@ -85,6 +86,25 @@
       hint.style.cssText = 'font-size:12px;color:var(--text2);margin:8px 0;';
       calendar.before(hint);
     }
+  }
+
+  // Native Android releases use their own version numbers and signing key.
+  // The upstream banner points at desktop installers, so hide it on Android.
+  const settings = document.getElementById('sec-settings');
+  if (settings) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    const title = document.createElement('h3');
+    title.textContent = 'Android app updates';
+    const help = document.createElement('p');
+    help.textContent = 'Checked automatically when opening the app. Development updates come from this Android fork.';
+    const button = document.createElement('button');
+    button.className = 'btn';
+    button.type = 'button';
+    button.textContent = 'Check for updates';
+    button.onclick = () => window.DomestiqueAndroid.checkUpdates();
+    card.append(title, help, button);
+    settings.prepend(card);
   }
 
   const setupStatus = document.getElementById('setup-link-status');
