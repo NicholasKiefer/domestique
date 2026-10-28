@@ -31,6 +31,13 @@ jobs:
           git remote add upstream https://github.com/platypus45/domestique.git
           upstream_branch=$(gh api repos/platypus45/domestique --jq .default_branch)
           git fetch upstream "$upstream_branch"
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+          git fetch origin clean-main
+          if ! git merge-base --is-ancestor origin/clean-main "$upstream_sha"; then
+            echo '::error::clean-main has diverged from upstream; refusing to overwrite it.'
+            exit 1
+          fi
+          git push origin "$upstream_sha:refs/heads/clean-main"
           if git merge-base --is-ancestor FETCH_HEAD HEAD; then
             echo 'Already up to date.'
             exit 0
